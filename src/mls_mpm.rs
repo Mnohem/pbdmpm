@@ -12,16 +12,14 @@ pub type Vector = Vec2;
 pub type Matrix = Mat2;
 pub type Real = f32;
 
-const CLAMP: Real = 1_000_000.0; // We clamps infinity to this
 const GRAVITY: Real = 0.3;
 
 pub struct Particle {
     pub x: Vector,
     pub v: Vector,
-    pub c: Matrix,
+    pub c: Matrix, // deformation displacement (D) when multiplied by dt
     pub f: Matrix, // deformation gradient
     pub mass: Real,
-    pub initial_volume: Real,
 }
 impl Particle {
     pub fn interpolated_weights(&self) -> [Vector; 3] {
@@ -41,7 +39,6 @@ impl Default for Particle {
             c: Matrix::ZERO,
             f: Matrix::IDENTITY,
             mass: 1.0,
-            initial_volume: 0.0,
         }
     }
 }
@@ -74,8 +71,15 @@ impl Simulation {
         // 1. reset our scratch-pad grid completely
         self.grid.fill(Cell::default());
 
+        // PBD MPM, basically working to reset our deformation gradient gradually
+        self.update_constraints(dt);
+
         // 2. particle-to-grid P2G
         // goal: transfers data from particles to our grid
+        // 2.1 Scatter mass to the grid so that we can get volume in full p2g step
+        self.scatter_mass();
+
+        // 2.2 P2G with volume calculated for each particle
         self.p2g(dt);
 
         // 3. calculate grid velocities
@@ -85,6 +89,7 @@ impl Simulation {
             .enumerate()
             .filter(|(_, c)| c.mass > 0.0)
         {
+            // note: before this step, "cell.v" refers to MOMENTUM, not velocity!
             // 3.1: calculate grid velocity based on momentum found in the P2G stage
             cell.v /= cell.mass;
             cell.v += dt * Vector::new(0.0, GRAVITY);
@@ -101,57 +106,53 @@ impl Simulation {
             }
         }
 
+        // 3.3: Soften particle velocities near the boundaries
+        let wall_min: Real = 3.0;
+        let wall_max_x = (GRID_WIDTH - 1) as Real - wall_min;
+        let wall_max_y = (GRID_HEIGHT - 1) as Real - wall_min;
+
+        for p in self.particles.iter_mut() {
+            // safely clamp particle positions to be inside the grid
+            p.x = p.x.clamp(Vector::ONE, Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0));
+
+            // predictive boundary conditions that soften velocities near the domain's edges 
+            let x_n = p.x + p.v;
+            if x_n.x < wall_min { p.v.x += wall_min - x_n.x }
+            if x_n.x > wall_max_x { p.v.x += wall_max_x - x_n.x }
+            if x_n.y < wall_min { p.v.y += wall_min - x_n.y }
+            if x_n.y > wall_max_y { p.v.y += wall_max_y - x_n.y }
+        }
+
         // 4. grid-to-particle (G2P).
         // goal: report our grid's findings back to our particles, and integrate their position +
         // velocity forward
         self.g2p(dt);
     }
-    pub fn p2g(&mut self, dt: Real) {
-        let elastic_lambda = 10.0;
-        let elastic_mu = 20.0;
+    pub fn update_constraints(&mut self, dt: Real) {
+        for p in self.particles.iter_mut() {
+            let f_star = (p.c * dt + Matrix::IDENTITY) * p.f;
+            
+            p.c += (f_star.inverse() - Matrix::IDENTITY) / dt;
+            // Closest matrix to F* with det == 1
+            // let df = f_star.determinant();
+            // let cdf = clamp(abs(df), 0.1, 1000);
+            // let Q = (1.0f/(sign(df)*sqrt(cdf)))*F;
+            // // Interpolate between the two target shapes
+            // let alpha = g_simConstants.elasticityRatio;
+            // let tgt = alpha*(svdResult.U*svdResult.Vt) + (1.0-alpha)*Q;
+            //
+            // let diff = (tgt*inverse(particle.deformationGradient) - Identity) - particle.deformationDisplacement;
+            // particle.deformationDisplacement += g_simConstants.elasticRelaxation*diff;
+        }
+    }
 
+    pub fn scatter_mass(&mut self) {
         for p in self.particles.iter() {
-            // 2.1: calculate weights for the 3x3 neighbouring cells surrounding the particle's
-            // position on the grid using an interpolation function
             let cell_idx = p.x.as_uvec2();
             let weights = p.interpolated_weights();
 
-            // 2.2: calculate quantities like e.g. stress based on constitutive equation
-            let j = p.f.determinant();
-            // A is invertible iff det(A) != 0
-            // MPM course, page 46
-            // let volume = p.initial_volume * j;
-            let volume = j;
-            debug_assert!(!volume.is_subnormal());
-            let stress = {
-                // useful matrices for Neo-Hookean model
-                let f_t = p.f.transpose();
-                let f_t_inv = f_t.inverse();
-                // MPM course equation 48
-                let p_term_0 = elastic_mu * (p.f - f_t_inv);
-                let p_term_1 = elastic_lambda * j.ln() * f_t_inv;
-                let p_term = p_term_0 + p_term_1;
-                // cauchy_stress = (1 / det(F)) * P * F_T
-                // equation 38, MPM course
-                (1.0 / j).clamp(-CLAMP, CLAMP) * (p_term * f_t)
-            };
-            // debug_assert!(!stress.is_nan());
-            // (Mp)^-1 = 4, see APIC paper and MPM course page 42
-            // this term is used in the MLS-MPM paper last equation with quadratic weights,
-            // Mp = (1/4) * (delta_x)^2
-            // in this simulation, delta_x = 1, because i scale the rendering of the domain rather
-            // than the domain itself
-            // we multiply by dt as part of the process of fusing the momentum and force update
-            let last_eq_term_0 = if !stress.is_finite() {
-                Matrix::ZERO
-            } else {
-                -volume * 4.0 * stress * dt
-            };
-            // debug_assert!(!eq_16_term_0.is_nan());
-
-            // 2.3:
             for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
-                // scatter our particle's momentum to the grid, using the cell's interpolation
+                // scatter our particle's mass to the grid, using the cell's interpolation
                 // weight calculated in 2.1
                 let weight = weights[gx].x * weights[gy].y;
 
@@ -162,24 +163,83 @@ impl Simulation {
                 let cell = &mut self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH];
                 let weighted_mass = weight * p.mass;
                 cell.mass += weighted_mass;
-                // fused force/momentum update form MLS_MPM
-                // see MLS_MPM paper, equation listed after eqn. 28
-                let momentum = (last_eq_term_0 * weight) * cell_dist;
-                // debug_assert!(!momentum.is_nan());
-                cell.v += weighted_mass * (p.v + q) + momentum;
-                // note: currently "cell.v" refers to MOMENTUM, not velocity!
-                // this gets corrected in the UpdateGrid step below.
+                cell.v += weighted_mass * (p.v + q);
+                // This is just the force portion, not momentum portion which is derived from
+                // constitutive equations ie neo-hookean
             }
+        }
+    }
+    pub fn p2g(&mut self, dt: Real) {
+        let elastic_lambda = 10.0;
+        let elastic_mu = 20.0;
+        
+        let mut first = true;
+        for p in self.particles.iter() {
+            // 2.1: calculate weights for the 3x3 neighbouring cells surrounding the particle's
+            // position on the grid using an interpolation function
+            let cell_idx = p.x.as_uvec2();
+            let weights = p.interpolated_weights();
+
+            // estimating particle volume by summing up neighbourhood's weighted mass contribution
+            // MPM course, equation 152 
+            let volume = {
+                let mut density = 0.0;
+                for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
+                    let weight = weights[gx].x * weights[gy].y;
+                    let cell_index = (cell_idx.x as usize + gx - 1) + (cell_idx.y as usize + gy - 1) * GRID_WIDTH;
+                    density += self.grid[cell_index].mass * weight;
+                }
+                p.mass / density
+            };
+
+            // 2.2: calculate quantities like e.g. stress based on constitutive equation
+            let stress = {
+                let j = p.f.determinant();
+                let f_t = p.f.transpose();
+                // MPM course equation 48
+                let p_term_0 = elastic_mu * (p.f * f_t - Matrix::IDENTITY);
+                let p_term_1 = Matrix::from_diagonal(Vector::splat(elastic_lambda * j.ln()));
+                let p_term = p_term_0 + p_term_1;
+
+                if first {
+                    println!("j: {j}, j.ln(): {}, stress: {}", j.ln(), p_term / j);
+                }
+                // cauchy_stress = (1 / det(F)) * P * F_T
+                // equation 38, MPM course
+                // already incorporated F_T into p_terms to cancel out F_T_inv
+                p_term / j
+            };
+            // (Mp)^-1 = 4, see APIC paper and MPM course page 42
+            // this term is used in the MLS-MPM paper last equation with quadratic weights,
+            // Mp = (1/4) * (delta_x)^2
+            // in this simulation, delta_x = 1, because i scale the rendering of the domain rather
+            // than the domain itself
+            // we multiply by dt as part of the process of fusing the momentum and force update
+            let last_eq_term_0 = -volume * 4.0 * stress * dt;
+
+            // 2.3:
+            for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
+                // scatter our particle's momentum to the grid, using the cell's interpolation
+                // weight calculated in 2.1
+                let weight = weights[gx].x * weights[gy].y;
+
+                let cell_x = UVec2::new(cell_idx.x + gx as u32 - 1, cell_idx.y + gy as u32 - 1);
+                let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - p.x) + 0.5;
+
+                let cell = &mut self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH];
+                let momentum = (last_eq_term_0 * weight) * cell_dist;
+                cell.v += momentum;
+                // note: currently "cell.v" refers to MOMENTUM, not velocity!
+                // this gets corrected in the UpdateGrid step
+            }
+            first = false;
         }
     }
     pub fn g2p(&mut self, dt: Real) {
         for p in self.particles.iter_mut() {
             // reset particle velocity. we calculate it from scratch each step using the grid
             p.v = Vector::ZERO;
-            // TODO 4.1: update particle's deformation gradient using MLS-MPM's velocity estimate
-            // Reference: MLS-MPM paper, Eq. 17
-            //
-            // 4.2: calculate neighboring cell weights as in step 2.1
+            // 4.1: calculate neighboring cell weights as in step 2.1
             // note: our particle's haven't moved on the grid at all by this point, so the weights
             // will be identical
             let cell_idx = p.x.floor().as_uvec2();
@@ -198,8 +258,7 @@ impl Simulation {
                     self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH].v * weight;
 
                 // APIC paper equation 10, constructing inner term for B
-                let term =
-                    Matrix::from_cols(weighted_vel * cell_dist.x, weighted_vel * cell_dist.y);
+                let term = Matrix::from_cols(weighted_vel * cell_dist.x, weighted_vel * cell_dist.y);
 
                 b += term;
                 p.v += weighted_vel;
@@ -208,8 +267,7 @@ impl Simulation {
             p.x += p.v * dt;
 
             // safety clamp to ensure particles don't exit simulation domain
-            p.x =
-                p.x.clamp(Vector::ONE, Vector::splat(GRID_SIZE as Real - 2.0));
+            p.x = p.x.clamp(Vector::ONE, Vector::splat(GRID_SIZE as Real - 2.0));
 
             p.c = b * 4.0;
             // deformation gradient update - MPM course, equation 181
@@ -217,4 +275,8 @@ impl Simulation {
             p.f *= dt * p.c + Matrix::IDENTITY;
         }
     }
+}
+
+fn polar(mat: Matrix) -> Matrix {
+    Matrix::IDENTITY
 }

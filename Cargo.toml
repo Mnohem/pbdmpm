@@ -8,6 +8,7 @@ env_logger = "0.11.3"
 error-iter = "0.4.1"
 glam = { version = "0.29.0", features = ["rand"] }
 log = "0.4.21"
+nalgebra = { version = "0.33.2", features = ["rand"] }
 pixels = "0.13.0"
 rand = "0.8.5"
 tao = { version = "0.28.0", features = ["rwh_05"] }

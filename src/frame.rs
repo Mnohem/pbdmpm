@@ -83,29 +83,10 @@ impl World {
             }
             x += spacing;
         }
-        let mut simulation = Simulation {
+        World { simulation: Simulation {
             particles,
             ..Default::default()
-        };
-        // scatter particle mass to the grid for computing initial volumes
-        simulation.p2g(1.0);
-        for p in simulation.particles.iter_mut() {
-            let cell_idx = p.x.floor().as_uvec2();
-            let weights = p.interpolated_weights();
-            
-            let mut density = 0.0;
-            for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
-                // scatter our particle's momentum to the grid, using the cell's interpolation
-                // weight calculated in 2.1
-                let weight = weights[gx].x * weights[gy].y;
-                let cell_index = (cell_idx.x as usize + gx - 1) + (cell_idx.y as usize + gy - 1) * mls_mpm::GRID_WIDTH;
-                density += simulation.grid[cell_index].mass * weight;
-            }
-
-            p.initial_volume = p.mass / density;
-        }
-
-        World { simulation }
+        } }
     }
     pub fn init_box() -> Self {
         let mut particles = vec![];
@@ -125,26 +106,9 @@ impl World {
             }
             x += spacing;
         }
-        let mut simulation = Simulation {
+        World { simulation: Simulation {
             particles,
             ..Default::default()
-        };
-        // scatter particle mass to the grid for computing initial volumes
-        simulation.p2g(1.0);
-        for p in simulation.particles.iter_mut() {
-            let cell_idx = p.x.floor().as_uvec2();
-            let weights = p.interpolated_weights();
-            
-            let mut density = 0.0;
-            for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
-                let weight = weights[gx].x * weights[gy].y;
-                let cell_index = (cell_idx.x as usize + gx - 1) + (cell_idx.y as usize + gy - 1) * mls_mpm::GRID_WIDTH;
-                density += simulation.grid[cell_index].mass * weight;
-            }
-
-            p.initial_volume = p.mass / density;
-        }
-
-        World { simulation }
+        } }
     }
 }
