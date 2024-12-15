@@ -67,6 +67,7 @@ impl Simulation {
         // TODO eventually dt will be a parameter
         // https://gafferongames.com/post/fix_your_timestep/
         let dt = 0.1;
+        // let iterations = 5;
 
         // 1. reset our scratch-pad grid completely
         self.grid.fill(Cell::default());
@@ -87,12 +88,13 @@ impl Simulation {
             .grid
             .iter_mut()
             .enumerate()
-            .filter(|(_, c)| c.mass > 0.0)
+            .filter(|(_, c)| c.mass.is_normal())
         {
             // note: before this step, "cell.v" refers to MOMENTUM, not velocity!
             // 3.1: calculate grid velocity based on momentum found in the P2G stage
             cell.v /= cell.mass;
             cell.v += dt * Vector::new(0.0, GRAVITY);
+            debug_assert!(cell.v.is_finite());
 
             // 3.2: enforce boundary conditions
             let x = i % GRID_WIDTH;
@@ -113,36 +115,50 @@ impl Simulation {
 
         for p in self.particles.iter_mut() {
             // safely clamp particle positions to be inside the grid
-            p.x = p.x.clamp(Vector::ONE, Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0));
+            p.x = p.x.clamp(
+                Vector::ONE,
+                Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0),
+            );
 
-            // predictive boundary conditions that soften velocities near the domain's edges 
+            // predictive boundary conditions that soften velocities near the domain's edges
             let x_n = p.x + p.v;
-            if x_n.x < wall_min { p.v.x += wall_min - x_n.x }
-            if x_n.x > wall_max_x { p.v.x += wall_max_x - x_n.x }
-            if x_n.y < wall_min { p.v.y += wall_min - x_n.y }
-            if x_n.y > wall_max_y { p.v.y += wall_max_y - x_n.y }
+            if x_n.x < wall_min {
+                p.v.x += wall_min - x_n.x
+            } else if x_n.x > wall_max_x {
+                p.v.x += wall_max_x - x_n.x
+            }
+            if x_n.y < wall_min {
+                p.v.y += wall_min - x_n.y
+            } else if x_n.y > wall_max_y {
+                p.v.y += wall_max_y - x_n.y
+            }
         }
 
         // 4. grid-to-particle (G2P).
         // goal: report our grid's findings back to our particles, and integrate their position +
         // velocity forward
         self.g2p(dt);
+
+        // 5. integrate our values to update our particle positions and deformation gradients
+        self.integrate(dt);
     }
     pub fn update_constraints(&mut self, dt: Real) {
         for p in self.particles.iter_mut() {
+            debug_assert!(p.c.is_finite());
+            debug_assert!(p.f.is_finite());
             let f_star = (p.c * dt + Matrix::IDENTITY) * p.f;
-            
-            p.c += (f_star.inverse() - Matrix::IDENTITY) / dt;
-            // Closest matrix to F* with det == 1
-            // let df = f_star.determinant();
-            // let cdf = clamp(abs(df), 0.1, 1000);
-            // let Q = (1.0f/(sign(df)*sqrt(cdf)))*F;
-            // // Interpolate between the two target shapes
-            // let alpha = g_simConstants.elasticityRatio;
-            // let tgt = alpha*(svdResult.U*svdResult.Vt) + (1.0-alpha)*Q;
-            //
-            // let diff = (tgt*inverse(particle.deformationGradient) - Identity) - particle.deformationDisplacement;
-            // particle.deformationDisplacement += g_simConstants.elasticRelaxation*diff;
+
+            let cdf = clamped_det(f_star);
+            let vol = f_star / (cdf.abs().sqrt() * cdf.signum());
+            let shape = polar_rotation(f_star);
+
+            // also called elasticity ratio
+            let alpha = 1.0;
+            let interp_term = alpha * shape + (1.0 - alpha) * vol;
+
+            let elastic_relaxation = 1.5;
+            let diff = (interp_term * p.f.inverse() - Matrix::IDENTITY) / dt - p.c;
+            p.c += elastic_relaxation * diff;
         }
     }
 
@@ -159,6 +175,7 @@ impl Simulation {
                 let cell_x = UVec2::new(cell_idx.x + gx as u32 - 1, cell_idx.y + gy as u32 - 1);
                 let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - p.x) + 0.5;
                 let q = p.c * cell_dist;
+                debug_assert!(q.is_finite());
 
                 let cell = &mut self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH];
                 let weighted_mass = weight * p.mass;
@@ -172,8 +189,7 @@ impl Simulation {
     pub fn p2g(&mut self, dt: Real) {
         let elastic_lambda = 10.0;
         let elastic_mu = 20.0;
-        
-        let mut first = true;
+
         for p in self.particles.iter() {
             // 2.1: calculate weights for the 3x3 neighbouring cells surrounding the particle's
             // position on the grid using an interpolation function
@@ -181,12 +197,13 @@ impl Simulation {
             let weights = p.interpolated_weights();
 
             // estimating particle volume by summing up neighbourhood's weighted mass contribution
-            // MPM course, equation 152 
+            // MPM course, equation 152
             let volume = {
                 let mut density = 0.0;
                 for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
                     let weight = weights[gx].x * weights[gy].y;
-                    let cell_index = (cell_idx.x as usize + gx - 1) + (cell_idx.y as usize + gy - 1) * GRID_WIDTH;
+                    let cell_index = (cell_idx.x as usize + gx - 1)
+                        + (cell_idx.y as usize + gy - 1) * GRID_WIDTH;
                     density += self.grid[cell_index].mass * weight;
                 }
                 p.mass / density
@@ -194,21 +211,21 @@ impl Simulation {
 
             // 2.2: calculate quantities like e.g. stress based on constitutive equation
             let stress = {
-                let j = p.f.determinant();
+                let j = clamped_det(p.f);
                 let f_t = p.f.transpose();
                 // MPM course equation 48
                 let p_term_0 = elastic_mu * (p.f * f_t - Matrix::IDENTITY);
                 let p_term_1 = Matrix::from_diagonal(Vector::splat(elastic_lambda * j.ln()));
                 let p_term = p_term_0 + p_term_1;
 
-                if first {
-                    println!("j: {j}, j.ln(): {}, stress: {}", j.ln(), p_term / j);
-                }
+                println!("j: {j}, j.ln(): {}, stress: {}", j.ln(), p_term / j);
+                debug_assert!(j.ln().is_finite());
                 // cauchy_stress = (1 / det(F)) * P * F_T
                 // equation 38, MPM course
                 // already incorporated F_T into p_terms to cancel out F_T_inv
                 p_term / j
             };
+
             // (Mp)^-1 = 4, see APIC paper and MPM course page 42
             // this term is used in the MLS-MPM paper last equation with quadratic weights,
             // Mp = (1/4) * (delta_x)^2
@@ -232,13 +249,13 @@ impl Simulation {
                 // note: currently "cell.v" refers to MOMENTUM, not velocity!
                 // this gets corrected in the UpdateGrid step
             }
-            first = false;
         }
     }
     pub fn g2p(&mut self, dt: Real) {
         for p in self.particles.iter_mut() {
             // reset particle velocity. we calculate it from scratch each step using the grid
             p.v = Vector::ZERO;
+            p.c = Matrix::ZERO;
             // 4.1: calculate neighboring cell weights as in step 2.1
             // note: our particle's haven't moved on the grid at all by this point, so the weights
             // will be identical
@@ -248,7 +265,6 @@ impl Simulation {
             // APIC paper (https://web.archive.org/web/20190427165435/https://www.math.ucla.edu/~jteran/papers/JSSTS15.pdf)
             // below equation 11 for clarification. this is calculating C = B * (D^-1) for APIC equation 8,
             // where B is calculated in the inner loop at (D^-1) = 4 is a constant when using quadratic interpolation functions
-            let mut b = Matrix::ZERO;
             for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
                 let weight = weights[gx].x * weights[gy].y;
 
@@ -256,20 +272,35 @@ impl Simulation {
                 let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - p.x) + 0.5;
                 let weighted_vel =
                     self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH].v * weight;
+                debug_assert!(
+                    !self.grid[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH]
+                        .v
+                        .is_nan()
+                );
+                debug_assert!(!weighted_vel.is_nan());
+                debug_assert!(weighted_vel.is_finite());
 
                 // APIC paper equation 10, constructing inner term for B
-                let term = Matrix::from_cols(weighted_vel * cell_dist.x, weighted_vel * cell_dist.y);
+                let term =
+                    Matrix::from_cols(weighted_vel * cell_dist.x, weighted_vel * cell_dist.y);
 
-                b += term;
                 p.v += weighted_vel;
+                p.c += term * 4.0;
             }
-            // 4.4: advect particle positions by their velocity
+        }
+    }
+    pub fn integrate(&mut self, dt: Real) {
+        for p in self.particles.iter_mut() {
+            // advect particle positions by their velocity
+            debug_assert!(p.v.is_finite());
             p.x += p.v * dt;
 
             // safety clamp to ensure particles don't exit simulation domain
-            p.x = p.x.clamp(Vector::ONE, Vector::splat(GRID_SIZE as Real - 2.0));
+            p.x = p.x.clamp(
+                Vector::ONE,
+                Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0),
+            );
 
-            p.c = b * 4.0;
             // deformation gradient update - MPM course, equation 181
             // Fp' = (I + dt * p.C) * Fp
             p.f *= dt * p.c + Matrix::IDENTITY;
@@ -277,6 +308,14 @@ impl Simulation {
     }
 }
 
-fn polar(mat: Matrix) -> Matrix {
-    Matrix::IDENTITY
+fn polar_rotation(a: Matrix) -> Matrix {
+    let inner = a + clamped_det(a).abs() * a.transpose().inverse();
+    inner / clamped_det(inner).abs().sqrt()
+}
+
+fn clamped_det(a: Matrix) -> Real {
+    const LOWER_DET_BOUND: Real = 0.1;
+    const UPPER_DET_BOUND: Real = 1000.0;
+    let det = a.determinant();
+    det.signum() * det.abs().clamp(LOWER_DET_BOUND, UPPER_DET_BOUND)
 }
