@@ -1,4 +1,4 @@
-use crate::mls_mpm::{self, *};
+use crate::pbd_mpm::{self, *};
 use glam::*;
 use rand::{
     distributions::{Distribution, Standard},
@@ -37,7 +37,6 @@ use rand::{
 //     }
 // }
 
-#[derive(Default)]
 pub struct World {
     pub simulation: Simulation,
 }
@@ -46,17 +45,17 @@ impl World {
     pub fn update(&mut self) {
         let iterations = 1;
         for _ in 0..iterations {
-            self.simulation.step();
+            self.simulation.step(0.1, 5);
         }
     }
 
     pub fn draw(&self, canvas: &mut [u32]) {
         canvas.fill(0xff889911);
 
-        for Particle { x, .. } in self.simulation.particles.iter() {
-            debug_assert!(x.x < mls_mpm::GRID_WIDTH as Real && x.y < mls_mpm::GRID_HEIGHT as Real);
-            canvas[(x.x * mls_mpm::CELL_WIDTH as Real).floor() as usize
-                + (x.y * mls_mpm::CELL_HEIGHT as Real).floor() as usize * crate::CANVAS_WIDTH] =
+        for x in self.simulation.particle_x.iter() {
+            debug_assert!(x.x < pbd_mpm::GRID_WIDTH as Real && x.y < pbd_mpm::GRID_HEIGHT as Real);
+            canvas[(x.x * pbd_mpm::CELL_WIDTH as Real).floor() as usize
+                + (x.y * pbd_mpm::CELL_HEIGHT as Real).floor() as usize * crate::CANVAS_WIDTH] =
                 0xffffffff;
         }
     }
@@ -76,17 +75,16 @@ impl World {
             while y < box_size as Real {
                 particles.push(Particle {
                     x: Into::<Vector>::into(box_origin.as_vec2()) + Vector::new(x, y),
-                    v: rng.sample(&distr),
+                    d: rng.sample(&distr),
                     ..Default::default()
                 });
                 y += spacing;
             }
             x += spacing;
         }
-        World { simulation: Simulation {
-            particles,
-            ..Default::default()
-        } }
+        World {
+            simulation: Simulation::new(particles),
+        }
     }
     pub fn init_box() -> Self {
         let mut particles = vec![];
@@ -106,9 +104,8 @@ impl World {
             }
             x += spacing;
         }
-        World { simulation: Simulation {
-            particles,
-            ..Default::default()
-        } }
+        World {
+            simulation: Simulation::new(particles),
+        }
     }
 }

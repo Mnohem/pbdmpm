@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 pub mod frame;
-pub mod mls_mpm;
+pub mod pbd_mpm;
 
 use error_iter::ErrorIter as _;
 use log::error;
@@ -37,7 +37,7 @@ fn main() -> Result<(), Error> {
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         Pixels::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32, surface_texture)?
     };
-    let mut world = frame::World::init_box();
+    let mut world = frame::World::random_init();
 
     event_loop.run(move |event, _, control_flow| {
         match event {
