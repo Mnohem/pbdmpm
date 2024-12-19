@@ -1,5 +1,6 @@
 use crate::pbd_mpm::{self, *};
 use glam::*;
+use rayon::prelude::*;
 use rand::{
     distributions::{Distribution, Standard},
     thread_rng, Rng,
@@ -43,10 +44,7 @@ pub struct World {
 
 impl World {
     pub fn update(&mut self) {
-        let iterations = 1;
-        for _ in 0..iterations {
-            self.simulation.step(0.1, 5);
-        }
+        self.simulation.step(0.1, 5);
     }
 
     pub fn draw(&self, canvas: &mut [u32]) {
@@ -67,7 +65,7 @@ impl World {
         let distr = Standard.map(|v: Vector| v * 2.0 - 1.0);
 
         let spacing = 0.5;
-        let box_origin = UVec2::new(16, 16);
+        let box_origin = UVec2::new(8, 8);
         let box_size = 16;
         let mut x = 0.0;
         while x < box_size as Real {
@@ -86,7 +84,7 @@ impl World {
             simulation: Simulation::new(particles),
         }
     }
-    pub fn init_box() -> Self {
+    pub fn init_liquid_box() -> Self {
         let mut particles = vec![];
 
         let spacing = 0.5;
@@ -98,6 +96,8 @@ impl World {
             while y < box_size as Real {
                 particles.push(Particle {
                     x: Into::<Vector>::into(box_origin.as_vec2()) + Vector::new(x, y),
+                    f: ConstrainedValue { liquid_density: 1.0 },
+                    matter: Matter::Liquid,
                     ..Default::default()
                 });
                 y += spacing;

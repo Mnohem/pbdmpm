@@ -1,4 +1,5 @@
 use glam::*;
+use rayon::prelude::*;
 
 const GRID_SIZE: usize = 64;
 pub const GRID_WIDTH: usize = GRID_SIZE;
@@ -11,50 +12,70 @@ pub const CELL_HEIGHT: usize = crate::CANVAS_HEIGHT / GRID_HEIGHT;
 pub type Vector = Vec2;
 pub type Matrix = Mat2;
 pub type Real = f32;
+pub type Atomic = std::sync::atomic::AtomicI32;
+pub type FixedPoint = i32;
 
 const GRAVITY: Real = -0.3;
 const FRICTION: Real = 0.5;
 const GRID_LOWER_BOUND: Vector = Vector::ONE;
 const GRID_UPPER_BOUND: Vector = Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0);
 
+const LIQUID_RELAXATION: Real = 1.5;
+const LIQUID_VISCOSITY: Real = 0.01;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Matter {
+    Elastic,
+    Liquid,
+}
+#[derive(Clone, Copy)]
+pub union ConstrainedValue {
+    pub deformation_gradient: Mat2,
+    pub liquid_density: f32,
+}
 pub struct Particle {
     pub x: Vector,
     pub d: Vector,
     pub c: Matrix, // deformation displacement (D) when multiplied by dt
-    pub f: Matrix, // deformation gradient
+    pub f: ConstrainedValue, // deformation gradient or liquid density
+    pub matter: Matter,
     pub mass: Real,
 }
-impl Particle {}
 impl Default for Particle {
     fn default() -> Self {
         Self {
             x: Vector::ZERO,
             d: Vector::ZERO,
             c: Matrix::ZERO,
-            f: Matrix::IDENTITY,
+            f: ConstrainedValue { deformation_gradient: Matrix::IDENTITY },
+            matter: Matter::Elastic,
             mass: 1.0,
         }
     }
 }
 
 pub struct Simulation {
-    grid_d: [Vector; GRID_WIDTH * GRID_HEIGHT],
-    grid_mass: [Real; GRID_WIDTH * GRID_HEIGHT],
+    grid_dx: [Atomic; GRID_WIDTH * GRID_HEIGHT],
+    grid_dy: [Atomic; GRID_WIDTH * GRID_HEIGHT],
+    grid_mass: [Atomic; GRID_WIDTH * GRID_HEIGHT],
     pub particle_x: Vec<Vector>,
     particle_d: Vec<Vector>,
     particle_c: Vec<Matrix>,
-    particle_f: Vec<Matrix>,
+    particle_f: Vec<ConstrainedValue>,
+    particle_matter: Vec<Matter>,
     particle_mass: Vec<Real>,
 }
 impl Default for Simulation {
     fn default() -> Self {
         Self {
-            grid_d: [Vector::ZERO; GRID_WIDTH * GRID_HEIGHT],
-            grid_mass: [0.0; GRID_WIDTH * GRID_HEIGHT],
+            grid_dx: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
+            grid_dy: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
+            grid_mass: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
             particle_x: vec![],
             particle_d: vec![],
             particle_c: vec![],
             particle_f: vec![],
+            particle_matter: vec![],
             particle_mass: vec![],
         }
     }
@@ -78,11 +99,20 @@ impl Default for Simulation {
 impl Simulation {
     pub fn new(particles: Vec<Particle>) -> Self {
         let mut sim = Self::default();
-        for &Particle { x, d, c, f, mass } in particles.iter() {
+        for &Particle {
+            x,
+            d,
+            c,
+            f,
+            matter,
+            mass,
+        } in particles.iter()
+        {
             sim.particle_x.push(x);
             sim.particle_d.push(d);
             sim.particle_c.push(c);
             sim.particle_f.push(f);
+            sim.particle_matter.push(matter);
             sim.particle_mass.push(mass);
         }
         sim
@@ -90,64 +120,85 @@ impl Simulation {
     // TODO https://gafferongames.com/post/fix_your_timestep/
     pub fn step(&mut self, dt: Real, iterations: usize) {
         for _ in 0..iterations {
-            // 1. reset our scratch-pad grid completely
-            self.grid_d.fill(Vector::ZERO);
-            self.grid_mass.fill(0.0);
+
+            self.grid_dx.fill_with(Default::default);
+            self.grid_dy.fill_with(Default::default);
+            self.grid_mass.fill_with(Default::default);
 
             // PBD MPM, basically working to reset our deformation gradient gradually
-            Self::update_constraints(&self.particle_f, &mut self.particle_c);
+            Self::update_constraints(&self.particle_matter, &self.particle_f, &mut self.particle_c);
 
-            // 2. particle-to-grid P2G
+            // 1. particle-to-grid P2G
             Self::p2g(
                 &self.particle_x,
                 &self.particle_d,
                 &self.particle_c,
                 &self.particle_mass,
-                &mut self.grid_mass,
-                &mut self.grid_d,
+                &self.grid_mass, &self.grid_dx, &self.grid_dy
             );
 
-            // 3. calculate grid displacements
-            Self::update_grid(&self.grid_mass, &mut self.grid_d);
+            // 2. calculate grid displacements
+            Self::update_grid(&self.grid_mass, &mut self.grid_dx, &mut self.grid_dy);
 
-            // 4. grid-to-particle (G2P).
+            // 3. grid-to-particle (G2P).
             Self::g2p(
-                &self.grid_d,
+                &self.grid_dx,
+                &self.grid_dy,
                 &self.particle_x,
                 &mut self.particle_d,
                 &mut self.particle_c,
             );
         }
 
-        // 5. integrate our values to update our particle positions and deformation gradients
+        // 4. integrate our values to update our particle positions and deformation gradients
         Self::integrate(
             dt,
             &self.particle_c,
+            &self.particle_matter,
             &mut self.particle_x,
             &mut self.particle_d,
             &mut self.particle_f,
         );
     }
-    pub fn update_constraints(particle_f: &[Matrix], particle_c: &mut [Matrix]) {
-        for (c, &f) in particle_c.iter_mut().zip(particle_f.iter()) {
+    pub fn update_constraints(particle_matter: &[Matter], particle_f: &[ConstrainedValue], particle_c: &mut [Matrix]) {
+        particle_c.par_iter_mut().zip(particle_f.par_iter()).zip(particle_matter.par_iter()).for_each(|((c, &constrained), &matter)| {
             debug_assert!(c.is_finite());
-            debug_assert!(f.is_finite());
-            let f_star = (*c + Matrix::IDENTITY) * f;
+            debug_assert!(unsafe { constrained.deformation_gradient.is_finite() });
 
-            let cdf = clamped_det(f_star);
-            let vol = f_star / (cdf.abs().sqrt() * cdf.signum());
-            let (u, _, vt) = svd2x2(f_star);
-            let shape = vt * u;
-            debug_assert_eq!(shape.determinant().round(), 1.0);
+            unsafe {
+                match (matter, constrained) {
+                    (Matter::Elastic, ConstrainedValue { deformation_gradient: f }) => {
+                        let f_star = (*c + Matrix::IDENTITY) * f;
 
-            // also called elasticity ratio
-            let alpha = 1.0;
-            let interp_term = alpha * shape + (1.0 - alpha) * vol;
+                        let cdf = clamped_det(f_star);
+                        let vol = f_star / (cdf.abs().sqrt() * cdf.signum());
+                        let (u, _, vt) = svd2x2(f_star);
+                        let shape = vt * u;
+                        debug_assert_eq!(shape.determinant().round(), 1.0);
 
-            let elastic_relaxation = 1.5;
-            let diff = (interp_term * f.inverse() - Matrix::IDENTITY) - *c;
-            *c += elastic_relaxation * diff;
-        }
+                        // also called elasticity ratio
+                        let alpha = 1.0;
+                        let interp_term = alpha * shape + (1.0 - alpha) * vol;
+
+                        let elastic_relaxation = 1.5;
+                        let diff = (interp_term * f.inverse() - Matrix::IDENTITY) - *c;
+                        *c += elastic_relaxation * diff;
+                    },
+                    (Matter::Liquid, ConstrainedValue { liquid_density }) => {
+                        // Simple liquid viscosity: just remove deviatoric part of the deformation displacement
+                        let deviatoric = -(*c + c.transpose());
+                        *c += LIQUID_VISCOSITY * 0.5 * deviatoric;
+                        // Volume preservation constraint:
+                        // we want to generate hydrostatic impulses with the form alpha*I
+                        // and we want the liquid volume integration (see particleIntegrate) to yield 1 = (1+tr(alpha*I + D))*det(F) at the end of the timestep.
+                        // where det(F) is stored as particle.liquidDensity.
+                        // Rearranging, we get the below expression that drives the deformation displacement towards preserving the volume.
+                        let alpha = 0.5 * (1.0 / liquid_density - trace(c) - 1.0);
+                        *c += LIQUID_RELAXATION * alpha * Matrix::IDENTITY;
+                    }
+                }
+            }
+        })
     }
 
     pub fn p2g(
@@ -155,81 +206,75 @@ impl Simulation {
         particle_d: &[Vector],
         particle_c: &[Matrix],
         particle_mass: &[Real],
-        grid_mass: &mut [Real; GRID_WIDTH * GRID_HEIGHT],
-        grid_d: &mut [Vector; GRID_WIDTH * GRID_HEIGHT],
-    ) {
-        for (((&x, &d), &c), &mass) in particle_x
-            .iter()
-            .zip(particle_d.iter())
-            .zip(particle_c.iter())
-            .zip(particle_mass.iter())
-        {
-            let cell_idx = x.as_uvec2();
-            let weights = interpolated_weights(x);
+        grid_mass: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dx: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dy: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+    ) { // here we modify over the whole grid, but they are given through shared references which
+        // is valid since we will only use atomic stores
+        particle_x.par_iter().zip(particle_d).zip(particle_c).zip(particle_mass).for_each(
+            |(((&x, &d), &c), &mass)| {
+                let cell_idx = x.as_uvec2();
+                let weights = interpolated_weights(x);
 
-            // estimating particle volume by summing up neighbourhood's weighted mass contribution
-            // MPM course, equation 152
-            // let volume = {
-            //     let mut density = 0.0;
-            //     for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
-            //         let weight = weights[gx].x * weights[gy].y;
-            //         let cell_index = (cell_idx.x as usize + gx - 1)
-            //             + (cell_idx.y as usize + gy - 1) * GRID_WIDTH;
-            //         density += self.grid[cell_index].mass * weight;
-            //     }
-            //     p.mass / density
-            // };
+                for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
+                    let weight = weights[gx].x * weights[gy].y;
 
-            for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
-                let weight = weights[gx].x * weights[gy].y;
+                    let cell_x = UVec2::new(cell_idx.x + gx as u32 - 1, cell_idx.y + gy as u32 - 1);
+                    let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - x) + 0.5;
 
-                let cell_x = UVec2::new(cell_idx.x + gx as u32 - 1, cell_idx.y + gy as u32 - 1);
-                let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - x) + 0.5;
+                    let weighted_mass = weight * mass;
+                    let momentum = weighted_mass * (d + c * cell_dist);
 
-                let weighted_mass = weight * mass;
-                let momentum = weighted_mass * (d + c * cell_dist);
-
-                grid_mass[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH] += weighted_mass;
-                grid_d[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH] += momentum;
-            }
-        }
+                    let idx = cell_x.x as usize + cell_x.y as usize * GRID_WIDTH;
+                    use std::sync::atomic::Ordering::*;
+                    grid_mass[idx].fetch_add(encode_fixed_point(weighted_mass), Relaxed);
+                    grid_dx[idx].fetch_add(encode_fixed_point(momentum.x), Relaxed);
+                    grid_dy[idx].fetch_add(encode_fixed_point(momentum.y), Relaxed);
+                }
+            })
     }
     pub fn update_grid(
-        grid_mass: &[Real; GRID_WIDTH * GRID_HEIGHT],
-        grid_d: &mut [Vector; GRID_WIDTH * GRID_HEIGHT],
+        grid_mass: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dx: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dy: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
     ) {
         // boundary conditions are done differently
-        for ((i, d), mass) in grid_d
-            .iter_mut()
+        grid_dx
+            .par_iter_mut()
+            .zip(grid_dy.par_iter_mut())
             .enumerate()
-            .zip(grid_mass.iter())
-            .filter(|(_, &mass)| mass > 1e-5)
-        {
-            // calculate grid displacement based on momentum found in the P2G stage
-            *d /= mass;
-
-            // enforce boundary conditions
-            let x = i % GRID_WIDTH;
-            let y = i / GRID_WIDTH;
-            if x < GRID_LOWER_BOUND.x as usize + 1 || x > GRID_UPPER_BOUND.x as usize - 1 {
-                d.x = 0.0
-            }
-            if y < GRID_LOWER_BOUND.y as usize + 1 || y > GRID_UPPER_BOUND.y as usize - 1 {
-                d.y = 0.0
-            }
-        }
+            .zip(grid_mass)
+            .filter(|(_, mass)| unsafe { decode_fixed_point(mass.as_ptr().read()) } > 1e-5)
+            .for_each(|((i, (dx, dy)), mass)| {
+                // calculate grid displacement based on momentum found in the P2G stage
+                unsafe {
+                    let d = 
+                        Vector::new(
+                            decode_fixed_point(dx.as_ptr().read()),
+                            decode_fixed_point(dy.as_ptr().read())
+                        ) / decode_fixed_point(mass.as_ptr().read());
+                    dx.as_ptr().write(encode_fixed_point(d.x));
+                    dy.as_ptr().write(encode_fixed_point(d.y));
+                };
+                // enforce boundary conditions
+                let x = i % GRID_WIDTH;
+                let y = i / GRID_WIDTH;
+                if x < GRID_LOWER_BOUND.x as usize + 1 || x > GRID_UPPER_BOUND.x as usize - 1 {
+                    unsafe { dx.as_ptr().write(0); }
+                }
+                if y < GRID_LOWER_BOUND.y as usize + 1 || y > GRID_UPPER_BOUND.y as usize - 1 {
+                    unsafe { dy.as_ptr().write(0); }
+                }
+            })
     }
     pub fn g2p(
-        grid_d: &[Vector; GRID_WIDTH * GRID_HEIGHT],
+        grid_dx: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dy: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
         particle_x: &[Vector],
         particle_d: &mut [Vector],
         particle_c: &mut [Matrix],
     ) {
-        for ((d, c), &x) in particle_d
-            .iter_mut()
-            .zip(particle_c.iter_mut())
-            .zip(particle_x.iter())
-        {
+        particle_d.par_iter_mut().zip(particle_c.par_iter_mut()).zip(particle_x).for_each(|((d, c), &x)| {
             // reset particle velocity. we calculate it from scratch each step using the grid
             *d = Vector::ZERO;
             *c = Matrix::ZERO;
@@ -248,8 +293,12 @@ impl Simulation {
 
                 let cell_x = UVec2::new((cell_idx.x + gx as u32) - 1, (cell_idx.y + gy as u32) - 1);
                 let cell_dist = (Into::<Vector>::into(cell_x.as_vec2()) - x) + 0.5;
-                let weighted_displacement =
-                    grid_d[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH] * weight;
+                // This is safe because we dont modify these atomics in g2p
+                let grid_d = unsafe { Vector::new(
+                    decode_fixed_point(grid_dx[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH].as_ptr().read()),
+                    decode_fixed_point(grid_dy[cell_x.x as usize + cell_x.y as usize * GRID_WIDTH].as_ptr().read())
+                ) };
+                let weighted_displacement = grid_d * weight;
 
                 // APIC paper equation 10, constructing inner term for B
                 let term = Matrix::from_cols(
@@ -260,47 +309,93 @@ impl Simulation {
                 *d += weighted_displacement;
             }
             *c = b * 4.0;
-        }
+        })
     }
     pub fn integrate(
         dt: Real,
         particle_c: &[Matrix],
+        particle_matter: &[Matter],
         particle_x: &mut [Vector],
         particle_d: &mut [Vector],
-        particle_f: &mut [Matrix],
+        particle_f: &mut [ConstrainedValue],
     ) {
-        for (((x, d), f), &c) in particle_x
-            .iter_mut()
-            .zip(particle_d.iter_mut())
-            .zip(particle_f.iter_mut())
-            .zip(particle_c.iter())
+        particle_x
+            .par_iter_mut()
+            .zip(particle_d.par_iter_mut())
+            .zip(particle_f.par_iter_mut())
+            .zip(particle_c)
+            .zip(particle_matter).for_each(|((((x, d), constrained), c), &matter)|
         {
-            // deformation gradient update - MPM course, equation 181
-            // Fp' = (I + p.C) * Fp
-            *f = (c + Matrix::IDENTITY) * *f;
-
-            let (u, mut sigma, vt) = svd2x2(*f);
-
-            sigma = sigma.clamp(Vector::splat(0.1), Vector::splat(10000.0));
-
-            *f = u * Matrix::from_diagonal(sigma) * vt;
-
             // advect particle positions by their displacement
             *x = (*x + *d).clamp(GRID_LOWER_BOUND, GRID_UPPER_BOUND);
 
-            // safely clamp particle positions to be inside the grid
-            if x.x <= GRID_LOWER_BOUND.x + 2.0 || x.x >= GRID_UPPER_BOUND.x - 2.0 {
-                d.y = d.y.lerp(0.0, FRICTION);
+            // deformation gradient update - MPM course, equation 181
+            // Fp' = (I + p.C) * Fp
+            unsafe {
+                match (matter, constrained) {
+                    (Matter::Elastic, ConstrainedValue { deformation_gradient: f }) => {
+                        *f = (*c + Matrix::IDENTITY) * *f;
+
+                        let (u, mut sigma, vt) = svd2x2(*f);
+
+                        sigma = sigma.clamp(Vector::splat(0.1), Vector::splat(10000.0));
+
+                        *f = u * Matrix::from_diagonal(sigma) * vt;
+
+                        if x.x <= GRID_LOWER_BOUND.x + 2.0 || x.x >= GRID_UPPER_BOUND.x - 2.0 {
+                            d.y = d.y.lerp(0.0, FRICTION);
+                        }
+                        if x.y <= GRID_LOWER_BOUND.y + 2.0 || x.y >= GRID_UPPER_BOUND.y - 2.0 {
+                            d.x = d.x.lerp(0.0, FRICTION);
+                        }
+                    },
+                    (Matter::Liquid, ConstrainedValue { liquid_density }) => {
+                        *liquid_density *= trace(c) + 1.0;
+                        *liquid_density = liquid_density.max(0.05);
+                    }
+                }
             }
-            if x.y <= GRID_LOWER_BOUND.y + 2.0 || x.y >= GRID_UPPER_BOUND.y - 2.0 {
-                d.x = d.x.lerp(0.0, FRICTION);
-            }
-            // *d = d.lerp(Vector::ZERO, DAMPING);
+
             // Add gravity here so that it only indirectly affects particles through p2g
             // We are using dt only when we want to create forces (or possibly also impulses?)
             d.y -= GRAVITY * dt * dt;
-        }
+        })
     }
+}
+
+// i think larger exponent is more accuracy?
+// Why are we even using fixed point? There is no native atomic float, so we convert our float into
+// fixed point so that we may use atomic addition with signed integers instead
+const FIXED_POINT_MULTIPLIER: Real = 1e7;
+fn decode_fixed_point(fixed: FixedPoint) -> Real {
+    fixed as Real / FIXED_POINT_MULTIPLIER
+}
+fn encode_fixed_point(float: Real) -> FixedPoint {
+    (float * FIXED_POINT_MULTIPLIER) as FixedPoint
+}
+
+pub fn interpolated_weights(x: Vector) -> [Vector; 3] {
+    let cell_diff = (x - x.floor()) - 0.5;
+    [
+        0.5 * (0.5 - cell_diff) * (0.5 - cell_diff),
+        0.75 - cell_diff * cell_diff,
+        0.5 * (0.5 + cell_diff) * (0.5 + cell_diff),
+    ]
+}
+
+pub fn particle_volume_estimate(p_x: Vector, p_mass: Real, grid_mass: &[Real; GRID_WIDTH * GRID_HEIGHT]) -> Real {
+    let cell_idx = p_x.as_uvec2();
+    let weights = interpolated_weights(p_x);
+    // estimating particle volume by summing up neighbourhood's weighted mass contribution
+    // MPM course, equation 152
+    let mut density = 0.0;
+    for (gx, gy) in (0..3).flat_map(|x| std::iter::repeat(x).zip(0..3)) {
+        let weight = weights[gx].x * weights[gy].y;
+        let cell_index = (cell_idx.x as usize + gx - 1)
+            + (cell_idx.y as usize + gy - 1) * GRID_WIDTH;
+        density += grid_mass[cell_index] * weight;
+    }
+    p_mass / density
 }
 
 // sigma is given as a vector of the diagonal
@@ -327,16 +422,9 @@ fn svd2x2(m: Matrix) -> (Matrix, Vector, Matrix) {
         Matrix::from_angle(theta),
     )
 }
-
-pub fn interpolated_weights(x: Vector) -> [Vector; 3] {
-    let cell_diff = (x - x.floor()) - 0.5;
-    [
-        0.5 * (0.5 - cell_diff) * (0.5 - cell_diff),
-        0.75 - cell_diff * cell_diff,
-        0.5 * (0.5 + cell_diff) * (0.5 + cell_diff),
-    ]
+fn trace(a: &Matrix) -> Real {
+    a.col(0).x + a.col(1).y
 }
-
 fn clamped_det(a: Matrix) -> Real {
     const LOWER_DET_BOUND: Real = 0.1;
     const UPPER_DET_BOUND: Real = 1000.0;
