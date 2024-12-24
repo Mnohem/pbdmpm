@@ -3,6 +3,13 @@ name = "prepixx"
 version = "0.1.0"
 edition = "2021"
 
+[dev-dependencies]
+criterion = { version = "*", features = ["html_reports"] }
+
+[[bench]]
+name = "short_mpm_sim"
+harness = false
+
 [dependencies]
 env_logger = "0.11.3"
 error-iter = "0.4.1"

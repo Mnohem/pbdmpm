@@ -1,10 +1,10 @@
 use crate::pbd_mpm::{self, *};
 use glam::*;
-use rayon::prelude::*;
 use rand::{
     distributions::{Distribution, Standard},
     thread_rng, Rng,
 };
+use rayon::prelude::*;
 /// Color representation as abgr
 // #[derive(Clone, Copy, Debug, Default)]
 // #[repr(u32)]
@@ -96,7 +96,9 @@ impl World {
             while y < box_size as Real {
                 particles.push(Particle {
                     x: Into::<Vector>::into(box_origin.as_vec2()) + Vector::new(x, y),
-                    f: ConstrainedValue { liquid_density: 1.0 },
+                    f: ConstrainedValue {
+                        liquid_density: 1.0,
+                    },
                     matter: Matter::Liquid,
                     ..Default::default()
                 });

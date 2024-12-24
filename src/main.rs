@@ -1,8 +1,5 @@
 #![deny(clippy::all)]
 
-pub mod frame;
-pub mod pbd_mpm;
-
 use error_iter::ErrorIter as _;
 use log::error;
 use pixels::{Error, Pixels, SurfaceTexture};
@@ -11,13 +8,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 
-const WINDOW_WIDTH: usize = 512;
-const WINDOW_HEIGHT: usize = 512;
-
-const DOWN_SCALE: usize = 2;
-
-pub const CANVAS_WIDTH: usize = WINDOW_WIDTH / DOWN_SCALE;
-pub const CANVAS_HEIGHT: usize = WINDOW_HEIGHT / DOWN_SCALE;
+use prepixx::{frame::World, CANVAS_HEIGHT, CANVAS_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH};
 
 fn main() -> Result<(), Error> {
     env_logger::init();
@@ -37,7 +28,7 @@ fn main() -> Result<(), Error> {
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         Pixels::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32, surface_texture)?
     };
-    let mut world = frame::World::random_init();
+    let mut world = World::random_init();
 
     event_loop.run(move |event, _, control_flow| {
         match event {
