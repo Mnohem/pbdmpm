@@ -57,6 +57,15 @@ impl World {
                 0xffffffff;
         }
     }
+    
+    pub fn spawn(&mut self, Particle { x, d, c, f, matter, mass }: Particle) {
+        self.simulation.particle_x.push(x);
+        self.simulation.particle_d.push(d);
+        self.simulation.particle_c.push(c);
+        self.simulation.particle_f.push(f);
+        self.simulation.particle_matter.push(matter);
+        self.simulation.particle_mass.push(mass);
+    }
 
     pub fn random_init() -> Self {
         let mut particles = vec![];

@@ -1,17 +1,18 @@
 #![deny(clippy::all)]
 
 use error_iter::ErrorIter as _;
-use log::error;
+use log::{error, info};
 use pixels::{Error, Pixels, SurfaceTexture};
-use tao::dpi::LogicalSize;
-use tao::event::{Event, WindowEvent};
+use tao::dpi::{LogicalSize, PhysicalPosition};
+use tao::event::{ElementState, Event, MouseButton, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 
-use prepixx::{frame::World, CANVAS_HEIGHT, CANVAS_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH};
+use prepixx::{frame::World, CANVAS_HEIGHT, CANVAS_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH, pbd_mpm::Particle};
 
 fn main() -> Result<(), Error> {
     env_logger::init();
+
     let event_loop = EventLoop::new();
     let window = {
         let size = LogicalSize::new(WINDOW_WIDTH as f64, WINDOW_HEIGHT as f64);
@@ -28,9 +29,11 @@ fn main() -> Result<(), Error> {
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         Pixels::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32, surface_texture)?
     };
-    let mut world = World::random_init();
+    let mut world = World::init_liquid_box();
 
-    event_loop.run(move |event, _, control_flow| {
+    let mut place_particle = false;
+
+    event_loop.run(move |event, event_loop_window_target, control_flow| {
         match event {
             Event::WindowEvent { event, .. } => match event {
                 // Close the window
@@ -45,6 +48,16 @@ fn main() -> Result<(), Error> {
                         *control_flow = ControlFlow::Exit;
                     }
                 }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } => place_particle = true,
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    button: MouseButton::Left,
+                    ..
+                } => place_particle = false,
 
                 _ => {}
             },
@@ -53,6 +66,20 @@ fn main() -> Result<(), Error> {
             Event::MainEventsCleared => {
                 // std::thread::sleep(std::time::Duration::from_millis(500));
                 world.update();
+
+                if place_particle {
+                    let PhysicalPosition { x, y } = event_loop_window_target.cursor_position().unwrap();
+
+                    info!("Cursor physical position at {x:.2}, {y:.2}");
+                    // world.spawn(Particle {
+                    //     x: Vector::new(x as f32, y as f32),
+                    //     f: ConstrainedValue {
+                    //         liquid_density: 1.0,
+                    //     },
+                    //     matter: Matter::Liquid,
+                    //     ..Default::default()
+                    // });
+                }
 
                 window.request_redraw();
             }
@@ -70,6 +97,7 @@ fn main() -> Result<(), Error> {
         }
     });
 }
+
 
 fn log_error<E: std::error::Error + 'static>(method_name: &str, err: E) {
     error!("{method_name}() failed: {err}");
