@@ -2,11 +2,11 @@
 
 use error_iter::ErrorIter as _;
 use glam::{Vec2, UVec2};
-use log::{error, info};
-use pixels::{Error, Pixels, SurfaceTexture};
+use log::error;
+use pixels::{Pixels, SurfaceTexture};
 use prepixx::{pbd_mpm::*, DOWN_SCALE};
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Event, MouseButton, WindowEvent};
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use prepixx::{

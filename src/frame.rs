@@ -4,39 +4,6 @@ use rand::{
     distributions::{Distribution, Standard},
     thread_rng, Rng,
 };
-use rayon::prelude::*;
-/// Color representation as abgr
-// #[derive(Clone, Copy, Debug, Default)]
-// #[repr(u32)]
-// pub enum Color {
-//     #[default]
-//     Gray = 0xff999999,
-//     Yellow = 0xff116090,
-// }
-//
-// pub trait Frame<const WIDTH: usize, const HEIGHT: usize> {
-//     fn get_frame(&self) -> &[[Color; WIDTH]; HEIGHT];
-//     fn draw_at(&self, [x, y]: [usize; 2], canvas: &mut [u8]) {
-//         let canvas: &mut [[Color; crate::CANVAS_WIDTH]; crate::CANVAS_HEIGHT] = unsafe {
-//             &mut *(canvas.as_mut_ptr() as *mut [[Color; crate::CANVAS_WIDTH]; crate::CANVAS_HEIGHT])
-//         };
-//         // can always optimize with unchecked
-//         for (canvas_row, frame_row) in canvas[y..(y + HEIGHT)]
-//             .iter_mut()
-//             .zip(self.get_frame().iter())
-//         {
-//             let canvas_row_section: &mut [Color; WIDTH] =
-//                 unsafe { &mut *(canvas_row[x..(x + WIDTH)].as_mut_ptr() as *mut [Color; WIDTH]) };
-//             *canvas_row_section = *frame_row;
-//         }
-//     }
-// }
-//
-// impl<const WIDTH: usize, const HEIGHT: usize> Frame<WIDTH, HEIGHT> for [[Color; WIDTH]; HEIGHT] {
-//     fn get_frame(&self) -> &Self {
-//         self
-//     }
-// }
 
 pub struct World {
     pub simulation: Simulation,
