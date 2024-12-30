@@ -122,9 +122,9 @@ impl Simulation {
     // TODO https://gafferongames.com/post/fix_your_timestep/
     pub fn step(&mut self, dt: Real, iterations: usize) {
         for _ in 0..iterations {
-            self.grid_dx.fill_with(Default::default);
-            self.grid_dy.fill_with(Default::default);
-            self.grid_mass.fill_with(Default::default);
+            self.grid_dx = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
+            self.grid_dy = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
+            self.grid_mass = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
 
             // PBD MPM, basically working to reset our deformation gradient gradually
             Self::update_constraints(
