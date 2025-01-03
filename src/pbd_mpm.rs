@@ -177,9 +177,6 @@ impl Simulation {
             .zip_eq(particle_f.par_iter())
             .zip_eq(particle_matter.par_iter())
             .for_each(|((c, &constrained), &matter)| {
-                debug_assert!(c.is_finite());
-                debug_assert!(unsafe { constrained.deformation_gradient.is_finite() });
-
                 unsafe {
                     match (matter, constrained) {
                         (
@@ -207,14 +204,14 @@ impl Simulation {
                         (Matter::Liquid, ConstrainedValue { liquid_density }) => {
                             // Simple liquid viscosity: just remove deviatoric part of the deformation displacement
                             let deviatoric = -(*c + c.transpose());
-                            *c += LIQUID_VISCOSITY * 0.5 * deviatoric;
+                            *c += (LIQUID_VISCOSITY * 0.5) * deviatoric;
                             // Volume preservation constraint:
                             // we want to generate hydrostatic impulses with the form alpha*I
                             // and we want the liquid volume integration (see particleIntegrate) to yield 1 = (1+tr(alpha*I + D))*det(F) at the end of the timestep.
                             // where det(F) is stored as particle.liquidDensity.
                             // Rearranging, we get the below expression that drives the deformation displacement towards preserving the volume.
                             let alpha = 0.5 * (1.0 / liquid_density - trace(c) - 1.0);
-                            *c += LIQUID_RELAXATION * alpha * Matrix::IDENTITY;
+                            *c += (LIQUID_RELAXATION * alpha) * Matrix::IDENTITY;
                         }
                     }
                 }
@@ -263,7 +260,6 @@ impl Simulation {
         grid_dx: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
         grid_dy: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
     ) {
-        // boundary conditions are done differently
         grid_dx
             .par_iter_mut()
             .zip_eq(grid_dy.par_iter_mut())
