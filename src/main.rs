@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
 use error_iter::ErrorIter as _;
-use glam::{Vec2, UVec2};
+use glam::{UVec2, Vec2};
 use log::error;
 use pixels::{Pixels, SurfaceTexture};
 use prepixx::{pbd_mpm::*, DOWN_SCALE};
@@ -91,7 +91,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_position = UVec2::new((position.x / DOWN_SCALE as f64) as u32, (position.y / DOWN_SCALE as f64) as u32);
+                self.cursor_position = UVec2::new(
+                    (position.x / DOWN_SCALE as f64) as u32,
+                    (position.y / DOWN_SCALE as f64) as u32,
+                );
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -117,14 +120,14 @@ impl ApplicationHandler for App {
     }
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         if self.place_particle {
-            let sim_position = self.cursor_position.as_vec2() / Vec2::new(CELL_WIDTH as f32, CELL_HEIGHT as f32);
+            let sim_position =
+                self.cursor_position.as_vec2() / Vec2::new(CELL_WIDTH as f32, CELL_HEIGHT as f32);
             match (sim_position.x as usize, sim_position.y as usize) {
                 (1..GRID_WIDTH, 1..GRID_HEIGHT) => self.world.spawn(Particle {
-                    x: Vector::new(sim_position.x, sim_position.y),
-                    f: ConstrainedValue {
+                    x: sim_position.into(),
+                    matter: Matter::Liquid {
                         liquid_density: 1.0,
                     },
-                    matter: Matter::Liquid,
                     ..Default::default()
                 }),
                 _ => {}

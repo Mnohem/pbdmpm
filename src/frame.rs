@@ -17,7 +17,7 @@ impl World {
     pub fn draw(&self, canvas: &mut [u32]) {
         canvas.fill(0xff889911);
 
-        for x in self.simulation.particle_x.iter() {
+        for x in self.simulation.liquids.particle_x.iter().chain(self.simulation.elastics.particle_x.iter()) {
             debug_assert!(x.x < pbd_mpm::GRID_WIDTH as Real && x.y < pbd_mpm::GRID_HEIGHT as Real);
             canvas[(x.x * pbd_mpm::CELL_WIDTH as Real).floor() as usize
                 + (x.y * pbd_mpm::CELL_HEIGHT as Real).floor() as usize * crate::CANVAS_WIDTH] =
@@ -25,13 +25,25 @@ impl World {
         }
     }
     
-    pub fn spawn(&mut self, Particle { x, d, c, f, matter, mass }: Particle) {
-        self.simulation.particle_x.push(x);
-        self.simulation.particle_d.push(d);
-        self.simulation.particle_c.push(c);
-        self.simulation.particle_f.push(f);
-        self.simulation.particle_matter.push(matter);
-        self.simulation.particle_mass.push(mass);
+    pub fn spawn(&mut self, Particle { x, d, c, matter, mass }: Particle) {
+        match matter {
+            Matter::Elastic {
+                deformation_gradient: f,
+            } => {
+                self.simulation.elastics.particle_x.push(x);
+                self.simulation.elastics.particle_d.push(d);
+                self.simulation.elastics.particle_c.push(c);
+                self.simulation.elastics.particle_f.push(f);
+                self.simulation.elastics.particle_mass.push(mass);
+            }
+            Matter::Liquid { liquid_density } => {
+                self.simulation.liquids.particle_x.push(x);
+                self.simulation.liquids.particle_d.push(d);
+                self.simulation.liquids.particle_c.push(c);
+                self.simulation.liquids.particle_desired_density.push(liquid_density);
+                self.simulation.liquids.particle_mass.push(mass);
+            }
+        }
     }
 
     pub fn random_init() -> Self {
@@ -72,10 +84,9 @@ impl World {
             while y < box_size as Real {
                 particles.push(Particle {
                     x: Into::<Vector>::into(box_origin.as_vec2()) + Vector::new(x, y),
-                    f: ConstrainedValue {
+                    matter: Matter::Liquid {
                         liquid_density: 1.0,
                     },
-                    matter: Matter::Liquid,
                     ..Default::default()
                 });
                 y += spacing;

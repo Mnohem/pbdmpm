@@ -23,21 +23,15 @@ const GRID_UPPER_BOUND: Vector = Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIG
 const LIQUID_RELAXATION: Real = 1.5;
 const LIQUID_VISCOSITY: Real = 0.01;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Matter {
-    Elastic,
-    Liquid,
-}
 #[derive(Clone, Copy)]
-pub union ConstrainedValue {
-    pub deformation_gradient: Mat2,
-    pub liquid_density: f32,
+pub enum Matter {
+    Elastic { deformation_gradient: Matrix },
+    Liquid { liquid_density: Real },
 }
 pub struct Particle {
     pub x: Vector,
     pub d: Vector,
-    pub c: Matrix,           // deformation displacement (D) when multiplied by dt
-    pub f: ConstrainedValue, // deformation gradient or liquid density
+    pub c: Matrix, // deformation displacement (D) when multiplied by dt
     pub matter: Matter,
     pub mass: Real,
 }
@@ -47,25 +41,34 @@ impl Default for Particle {
             x: Vector::ZERO,
             d: Vector::ZERO,
             c: Matrix::ZERO,
-            f: ConstrainedValue {
-                deformation_gradient: Matrix::IDENTITY,
+            matter: Matter::Elastic {
+                deformation_gradient: Matrix::ZERO,
             },
-            matter: Matter::Elastic,
             mass: 1.0,
         }
     }
 }
 
+pub struct LiquidStorage {
+    pub particle_x: Vec<Vector>,
+    pub particle_d: Vec<Vector>,
+    pub particle_c: Vec<Matrix>,
+    pub particle_desired_density: Vec<Real>,
+    pub particle_mass: Vec<Real>,
+}
+pub struct ElasticStorage {
+    pub particle_x: Vec<Vector>,
+    pub particle_d: Vec<Vector>,
+    pub particle_c: Vec<Matrix>,
+    pub particle_f: Vec<Matrix>,
+    pub particle_mass: Vec<Real>,
+}
 pub struct Simulation {
     grid_dx: [Atomic; GRID_WIDTH * GRID_HEIGHT],
     grid_dy: [Atomic; GRID_WIDTH * GRID_HEIGHT],
     grid_mass: [Atomic; GRID_WIDTH * GRID_HEIGHT],
-    pub particle_x: Vec<Vector>,
-    pub particle_d: Vec<Vector>,
-    pub particle_c: Vec<Matrix>,
-    pub particle_f: Vec<ConstrainedValue>,
-    pub particle_matter: Vec<Matter>,
-    pub particle_mass: Vec<Real>,
+    pub liquids: LiquidStorage,
+    pub elastics: ElasticStorage,
 }
 impl Default for Simulation {
     fn default() -> Self {
@@ -73,12 +76,20 @@ impl Default for Simulation {
             grid_dx: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
             grid_dy: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
             grid_mass: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
-            particle_x: vec![],
-            particle_d: vec![],
-            particle_c: vec![],
-            particle_f: vec![],
-            particle_matter: vec![],
-            particle_mass: vec![],
+            liquids: LiquidStorage {
+                particle_x: vec![],
+                particle_d: vec![],
+                particle_c: vec![],
+                particle_desired_density: vec![],
+                particle_mass: vec![],
+            },
+            elastics: ElasticStorage {
+                particle_x: vec![],
+                particle_d: vec![],
+                particle_c: vec![],
+                particle_f: vec![],
+                particle_mass: vec![],
+            },
         }
     }
 }
@@ -105,17 +116,28 @@ impl Simulation {
             x,
             d,
             c,
-            f,
             matter,
             mass,
         } in particles.iter()
         {
-            sim.particle_x.push(x);
-            sim.particle_d.push(d);
-            sim.particle_c.push(c);
-            sim.particle_f.push(f);
-            sim.particle_matter.push(matter);
-            sim.particle_mass.push(mass);
+            match matter {
+                Matter::Elastic {
+                    deformation_gradient: f,
+                } => {
+                    sim.elastics.particle_x.push(x);
+                    sim.elastics.particle_d.push(d);
+                    sim.elastics.particle_c.push(c);
+                    sim.elastics.particle_f.push(f);
+                    sim.elastics.particle_mass.push(mass);
+                }
+                Matter::Liquid { liquid_density } => {
+                    sim.liquids.particle_x.push(x);
+                    sim.liquids.particle_d.push(d);
+                    sim.liquids.particle_c.push(c);
+                    sim.liquids.particle_desired_density.push(liquid_density);
+                    sim.liquids.particle_mass.push(mass);
+                }
+            }
         }
         sim
     }
@@ -127,18 +149,30 @@ impl Simulation {
             self.grid_mass = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
 
             // PBD MPM, basically working to reset our deformation gradient gradually
-            Self::update_constraints(
-                &self.particle_matter,
-                &self.particle_f,
-                &mut self.particle_c,
+            Self::liquid_constraints(
+                &self.liquids.particle_desired_density,
+                &mut self.liquids.particle_c,
+            );
+            Self::elastic_constraints(
+                &self.elastics.particle_f,
+                &mut self.elastics.particle_c,
             );
 
             // 1. particle-to-grid P2G
             Self::p2g(
-                &self.particle_x,
-                &self.particle_d,
-                &self.particle_c,
-                &self.particle_mass,
+                &self.liquids.particle_x,
+                &self.liquids.particle_d,
+                &self.liquids.particle_c,
+                &self.liquids.particle_mass,
+                &self.grid_mass,
+                &self.grid_dx,
+                &self.grid_dy,
+            );
+            Self::p2g(
+                &self.elastics.particle_x,
+                &self.elastics.particle_d,
+                &self.elastics.particle_c,
+                &self.elastics.particle_mass,
                 &self.grid_mass,
                 &self.grid_dx,
                 &self.grid_dy,
@@ -151,70 +185,71 @@ impl Simulation {
             Self::g2p(
                 &self.grid_dx,
                 &self.grid_dy,
-                &self.particle_x,
-                &mut self.particle_d,
-                &mut self.particle_c,
+                &self.liquids.particle_x,
+                &mut self.liquids.particle_d,
+                &mut self.liquids.particle_c,
+            );
+            Self::g2p(
+                &self.grid_dx,
+                &self.grid_dy,
+                &self.elastics.particle_x,
+                &mut self.elastics.particle_d,
+                &mut self.elastics.particle_c,
             );
         }
 
         // 4. integrate our values to update our particle positions and deformation gradients
-        Self::integrate(
+        Self::liquid_integrate(
             dt,
-            &self.particle_c,
-            &self.particle_matter,
-            &mut self.particle_x,
-            &mut self.particle_d,
-            &mut self.particle_f,
+            &self.liquids.particle_c,
+            &mut self.liquids.particle_x,
+            &mut self.liquids.particle_d,
+            &mut self.liquids.particle_desired_density,
+        );
+        Self::elastic_integrate(
+            dt,
+            &self.elastics.particle_c,
+            &mut self.elastics.particle_x,
+            &mut self.elastics.particle_d,
+            &mut self.elastics.particle_f,
         );
     }
-    pub fn update_constraints(
-        particle_matter: &[Matter],
-        particle_f: &[ConstrainedValue],
-        particle_c: &mut [Matrix],
-    ) {
+    pub fn elastic_constraints(particle_f: &[Matrix], particle_c: &mut [Matrix]) {
         particle_c
             .par_iter_mut()
             .zip_eq(particle_f.par_iter())
-            .zip_eq(particle_matter.par_iter())
-            .for_each(|((c, &constrained), &matter)| {
-                unsafe {
-                    match (matter, constrained) {
-                        (
-                            Matter::Elastic,
-                            ConstrainedValue {
-                                deformation_gradient: f,
-                            },
-                        ) => {
-                            let f_star = (*c + Matrix::IDENTITY) * f;
+            .for_each(|(c, &f)| {
+                let f_star = (*c + Matrix::IDENTITY) * f;
 
-                            let cdf = clamped_det(f_star);
-                            let vol = f_star / (cdf.abs().sqrt() * cdf.signum());
-                            let (u, _, vt) = svd2x2(f_star);
-                            let shape = vt * u;
-                            debug_assert_eq!(shape.determinant().round(), 1.0);
+                let cdf = clamped_det(f_star);
+                let vol = f_star / (cdf.abs().sqrt() * cdf.signum());
+                let (u, _, vt) = svd2x2(f_star);
+                let shape = vt * u;
+                debug_assert_eq!(shape.determinant().round(), 1.0);
 
-                            // also called elasticity ratio
-                            let alpha = 1.0;
-                            let interp_term = alpha * shape + (1.0 - alpha) * vol;
+                // also called elasticity ratio
+                let alpha = 1.0;
+                let interp_term = alpha * shape + (1.0 - alpha) * vol;
 
-                            let elastic_relaxation = 1.5;
-                            let diff = (interp_term * f.inverse() - Matrix::IDENTITY) - *c;
-                            *c += elastic_relaxation * diff;
-                        }
-                        (Matter::Liquid, ConstrainedValue { liquid_density }) => {
-                            // Simple liquid viscosity: just remove deviatoric part of the deformation displacement
-                            let deviatoric = -(*c + c.transpose());
-                            *c += (LIQUID_VISCOSITY * 0.5) * deviatoric;
-                            // Volume preservation constraint:
-                            // we want to generate hydrostatic impulses with the form alpha*I
-                            // and we want the liquid volume integration (see particleIntegrate) to yield 1 = (1+tr(alpha*I + D))*det(F) at the end of the timestep.
-                            // where det(F) is stored as particle.liquidDensity.
-                            // Rearranging, we get the below expression that drives the deformation displacement towards preserving the volume.
-                            let alpha = 0.5 * (1.0 / liquid_density - trace(c) - 1.0);
-                            *c += (LIQUID_RELAXATION * alpha) * Matrix::IDENTITY;
-                        }
-                    }
-                }
+                let elastic_relaxation = 1.5;
+                let diff = (interp_term * f.inverse() - Matrix::IDENTITY) - *c;
+                *c += elastic_relaxation * diff;
+            })
+    }
+    pub fn liquid_constraints(particle_desired_density: &[Real], particle_c: &mut [Matrix]) {
+        particle_c
+            .par_iter_mut()
+            .zip_eq(particle_desired_density)
+            .for_each(|(c, &liquid_density)| {
+                let deviatoric = -(*c + c.transpose());
+                *c += (LIQUID_VISCOSITY * 0.5) * deviatoric;
+                // Volume preservation constraint:
+                // we want to generate hydrostatic impulses with the form alpha*I
+                // and we want the liquid volume integration (see particleIntegrate) to yield 1 = (1+tr(alpha*I + D))*det(F) at the end of the timestep.
+                // where det(F) is stored as particle.liquidDensity.
+                // Rearranging, we get the below expression that drives the deformation displacement towards preserving the volume.
+                let alpha = 0.5 * (1.0 / liquid_density - trace(c) - 1.0);
+                *c += (LIQUID_RELAXATION * alpha) * Matrix::IDENTITY;
             })
     }
 
@@ -350,56 +385,60 @@ impl Simulation {
                 *c = b * 4.0;
             })
     }
-    pub fn integrate(
+    pub fn liquid_integrate(
         dt: Real,
         particle_c: &[Matrix],
-        particle_matter: &[Matter],
         particle_x: &mut [Vector],
         particle_d: &mut [Vector],
-        particle_f: &mut [ConstrainedValue],
+        particle_desired_density: &mut [Real],
+    ) {
+        particle_x
+            .par_iter_mut()
+            .zip_eq(particle_d.par_iter_mut())
+            .zip_eq(particle_desired_density.par_iter_mut())
+            .zip_eq(particle_c)
+            .for_each(|(((x, d), liquid_density), c)| {
+                // advect particle positions by their displacement
+                *x = (*x + *d).clamp(GRID_LOWER_BOUND, GRID_UPPER_BOUND);
+
+                *liquid_density *= trace(c) + 1.0;
+                *liquid_density = liquid_density.max(0.05);
+
+                // Add gravity here so that it only indirectly affects particles through p2g
+                // We are using dt only when we want to create forces (or possibly also impulses?)
+                d.y -= GRAVITY * dt * dt;
+            })
+    }
+    pub fn elastic_integrate(
+        dt: Real,
+        particle_c: &[Matrix],
+        particle_x: &mut [Vector],
+        particle_d: &mut [Vector],
+        particle_f: &mut [Matrix],
     ) {
         particle_x
             .par_iter_mut()
             .zip_eq(particle_d.par_iter_mut())
             .zip_eq(particle_f.par_iter_mut())
             .zip_eq(particle_c)
-            .zip_eq(particle_matter)
-            .for_each(|((((x, d), constrained), c), &matter)| {
+            .for_each(|(((x, d), f), c)| {
                 // advect particle positions by their displacement
                 *x = (*x + *d).clamp(GRID_LOWER_BOUND, GRID_UPPER_BOUND);
 
-                // deformation gradient update - MPM course, equation 181
-                // Fp' = (I + p.C) * Fp
-                unsafe {
-                    match (matter, constrained) {
-                        (
-                            Matter::Elastic,
-                            ConstrainedValue {
-                                deformation_gradient: f,
-                            },
-                        ) => {
-                            *f = (*c + Matrix::IDENTITY) * *f;
+                *f = (*c + Matrix::IDENTITY) * *f;
 
-                            let (u, mut sigma, vt) = svd2x2(*f);
+                let (u, mut sigma, vt) = svd2x2(*f);
 
-                            sigma = sigma.clamp(Vector::splat(0.1), Vector::splat(10000.0));
+                sigma = sigma.clamp(Vector::splat(0.1), Vector::splat(10000.0));
 
-                            *f = u * Matrix::from_diagonal(sigma) * vt;
+                *f = u * Matrix::from_diagonal(sigma) * vt;
 
-                            if x.x <= GRID_LOWER_BOUND.x + 2.0 || x.x >= GRID_UPPER_BOUND.x - 2.0 {
-                                d.y = d.y.lerp(0.0, FRICTION);
-                            }
-                            if x.y <= GRID_LOWER_BOUND.y + 2.0 || x.y >= GRID_UPPER_BOUND.y - 2.0 {
-                                d.x = d.x.lerp(0.0, FRICTION);
-                            }
-                        }
-                        (Matter::Liquid, ConstrainedValue { liquid_density }) => {
-                            *liquid_density *= trace(c) + 1.0;
-                            *liquid_density = liquid_density.max(0.05);
-                        }
-                    }
+                if x.x <= GRID_LOWER_BOUND.x + 2.0 || x.x >= GRID_UPPER_BOUND.x - 2.0 {
+                    d.y = d.y.lerp(0.0, FRICTION);
                 }
-
+                if x.y <= GRID_LOWER_BOUND.y + 2.0 || x.y >= GRID_UPPER_BOUND.y - 2.0 {
+                    d.x = d.x.lerp(0.0, FRICTION);
+                }
                 // Add gravity here so that it only indirectly affects particles through p2g
                 // We are using dt only when we want to create forces (or possibly also impulses?)
                 d.y -= GRAVITY * dt * dt;
