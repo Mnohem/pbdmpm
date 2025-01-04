@@ -217,7 +217,7 @@ impl Simulation {
     pub fn elastic_constraints(particle_f: &[Matrix], particle_c: &mut [Matrix]) {
         particle_c
             .par_iter_mut()
-            .zip_eq(particle_f.par_iter())
+            .zip_eq(particle_f)
             .for_each(|(c, &f)| {
                 let f_star = (*c + Matrix::IDENTITY) * f;
 
