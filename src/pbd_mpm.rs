@@ -153,10 +153,7 @@ impl Simulation {
                 &self.liquids.particle_desired_density,
                 &mut self.liquids.particle_c,
             );
-            Self::elastic_constraints(
-                &self.elastics.particle_f,
-                &mut self.elastics.particle_c,
-            );
+            Self::elastic_constraints(&self.elastics.particle_f, &mut self.elastics.particle_c);
 
             // 1. particle-to-grid P2G
             Self::p2g(

@@ -17,15 +17,30 @@ impl World {
     pub fn draw(&self, canvas: &mut [u32]) {
         canvas.fill(0xff889911);
 
-        for x in self.simulation.liquids.particle_x.iter().chain(self.simulation.elastics.particle_x.iter()) {
+        for x in self
+            .simulation
+            .liquids
+            .particle_x
+            .iter()
+            .chain(self.simulation.elastics.particle_x.iter())
+        {
             debug_assert!(x.x < pbd_mpm::GRID_WIDTH as Real && x.y < pbd_mpm::GRID_HEIGHT as Real);
             canvas[(x.x * pbd_mpm::CELL_WIDTH as Real).floor() as usize
                 + (x.y * pbd_mpm::CELL_HEIGHT as Real).floor() as usize * crate::CANVAS_WIDTH] =
                 0xffffffff;
         }
     }
-    
-    pub fn spawn(&mut self, Particle { x, d, c, matter, mass }: Particle) {
+
+    pub fn spawn(
+        &mut self,
+        Particle {
+            x,
+            d,
+            c,
+            matter,
+            mass,
+        }: Particle,
+    ) {
         match matter {
             Matter::Elastic {
                 deformation_gradient: f,
@@ -40,7 +55,10 @@ impl World {
                 self.simulation.liquids.particle_x.push(x);
                 self.simulation.liquids.particle_d.push(d);
                 self.simulation.liquids.particle_c.push(c);
-                self.simulation.liquids.particle_desired_density.push(liquid_density);
+                self.simulation
+                    .liquids
+                    .particle_desired_density
+                    .push(liquid_density);
                 self.simulation.liquids.particle_mass.push(mass);
             }
         }
