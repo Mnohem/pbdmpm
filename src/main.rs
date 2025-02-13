@@ -122,18 +122,17 @@ impl ApplicationHandler for App {
         if self.place_particle {
             let sim_position =
                 self.cursor_position.as_vec2() / Vec2::new(CELL_WIDTH as f32, CELL_HEIGHT as f32);
-            match (sim_position.x as usize, sim_position.y as usize) {
-                (1..GRID_WIDTH, 1..GRID_HEIGHT) => self.world.spawn(Particle {
-                    x: sim_position.into(),
+            if let (1..GRID_WIDTH, 1..GRID_HEIGHT) =
+                (sim_position.x as usize, sim_position.y as usize)
+            {
+                self.world.spawn(Particle {
+                    x: sim_position,
                     matter: Matter::Liquid {
                         liquid_density: 1.0,
                     },
                     ..Default::default()
-                }),
-                _ => {}
+                })
             }
-
-            // info!("Cursor physical position at {x:.2}, {y:.2}");
         }
 
         self.world.update();
