@@ -1,28 +1,8 @@
-use glam::*;
+use crate::kernel::pbd_mpm::{FixedPoint, Matrix, Real, Vector, GRID_FLAT_LENGTH};
 use crate::kernel::*;
+use bytemuck::{cast, cast_slice, cast_slice_mut};
+use krnl::{buffer::Buffer, device::Device, krnl_core::buffer::UnsafeSlice};
 use rayon::prelude::*;
-
-const GRID_SIZE: usize = 64;
-pub const GRID_WIDTH: usize = GRID_SIZE;
-pub const GRID_HEIGHT: usize = GRID_SIZE;
-// CANVAS_WIDTH and CANVAS_HEIGHT must be larger than GRID_WIDTH and GRID_HEIGHT respectively
-// In the simulator the cell is a 1x1 square, this is the pixel width and height of a cell
-pub const CELL_WIDTH: usize = crate::CANVAS_WIDTH / GRID_WIDTH;
-pub const CELL_HEIGHT: usize = crate::CANVAS_HEIGHT / GRID_HEIGHT;
-
-pub type Vector = Vec2;
-pub type Matrix = Mat2;
-pub type Real = f32;
-pub type Atomic = std::sync::atomic::AtomicI32;
-pub type FixedPoint = i32;
-
-pub const GRAVITY: Real = -0.3;
-pub const FRICTION: Real = 0.5;
-pub const GRID_LOWER_BOUND: Vector = Vector::ONE;
-pub const GRID_UPPER_BOUND: Vector = Vector::new(GRID_WIDTH as Real - 2.0, GRID_HEIGHT as Real - 2.0);
-
-pub const LIQUID_RELAXATION: Real = 1.5;
-pub const LIQUID_VISCOSITY: Real = 0.01;
 
 #[derive(Clone, Copy)]
 pub enum Matter {
@@ -51,48 +31,28 @@ impl Default for Particle {
 }
 
 pub struct LiquidStorage {
-    pub particle_x: Vec<Vector>,
-    pub particle_d: Vec<Vector>,
-    pub particle_c: Vec<Matrix>,
-    pub particle_desired_density: Vec<Real>,
-    pub particle_mass: Vec<Real>,
+    pub particle_x: Buffer<u64>,
+    pub particle_d: Buffer<u64>,
+    pub particle_c: Buffer<u64>,
+    pub particle_desired_density: Buffer<Real>,
+    pub particle_mass: Buffer<Real>,
 }
 pub struct ElasticStorage {
-    pub particle_x: Vec<Vector>,
-    pub particle_d: Vec<Vector>,
-    pub particle_c: Vec<Matrix>,
-    pub particle_f: Vec<Matrix>,
-    pub particle_mass: Vec<Real>,
+    pub particle_x: Buffer<u64>,
+    pub particle_d: Buffer<u64>,
+    pub particle_c: Buffer<u64>,
+    pub particle_f: Buffer<u64>,
+    pub particle_mass: Buffer<Real>,
 }
+type Grid = Buffer<FixedPoint>;
 pub struct Simulation {
-    grid_dx: [Atomic; GRID_WIDTH * GRID_HEIGHT],
-    grid_dy: [Atomic; GRID_WIDTH * GRID_HEIGHT],
-    grid_mass: [Atomic; GRID_WIDTH * GRID_HEIGHT],
+    pub num_particles: u32,
+    grid_dx: Grid,
+    grid_dy: Grid,
+    grid_mass: Grid,
     pub liquids: LiquidStorage,
     pub elastics: ElasticStorage,
-}
-impl Default for Simulation {
-    fn default() -> Self {
-        Self {
-            grid_dx: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
-            grid_dy: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
-            grid_mass: [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT],
-            liquids: LiquidStorage {
-                particle_x: vec![],
-                particle_d: vec![],
-                particle_c: vec![],
-                particle_desired_density: vec![],
-                particle_mass: vec![],
-            },
-            elastics: ElasticStorage {
-                particle_x: vec![],
-                particle_d: vec![],
-                particle_c: vec![],
-                particle_f: vec![],
-                particle_mass: vec![],
-            },
-        }
-    }
+    pub device: Device,
 }
 
 // Switching to a Position based model is beneficial for removing our dependence on the time delta,
@@ -111,8 +71,19 @@ impl Default for Simulation {
 // The volume calculation seems to only be used for the fluid material, so it will be implemented
 // along with that
 impl Simulation {
-    pub fn new(particles: Vec<Particle>) -> Self {
-        let mut sim = Self::default();
+    pub fn new(particles: Vec<Particle>, device: Device) -> krnl::anyhow::Result<Self> {
+        let mut liquid_particle_x = vec![];
+        let mut liquid_particle_d = vec![];
+        let mut liquid_particle_c = vec![];
+        let mut liquid_particle_mass = vec![];
+        let mut particle_f = vec![];
+        let mut elastic_particle_x = vec![];
+        let mut elastic_particle_d = vec![];
+        let mut elastic_particle_c = vec![];
+        let mut elastic_particle_mass = vec![];
+        let mut particle_desired_density = vec![];
+        let num_particles = particles.len() as u32;
+
         for &Particle {
             x,
             d,
@@ -125,160 +96,274 @@ impl Simulation {
                 Matter::Elastic {
                     deformation_gradient: f,
                 } => {
-                    sim.elastics.particle_x.push(x);
-                    sim.elastics.particle_d.push(d);
-                    sim.elastics.particle_c.push(c);
-                    sim.elastics.particle_f.push(f);
-                    sim.elastics.particle_mass.push(mass);
+                    elastic_particle_x.push(cast(x));
+                    elastic_particle_d.push(cast(d));
+                    elastic_particle_c.push(cast(c.x_axis));
+                    elastic_particle_c.push(cast(c.y_axis));
+                    particle_f.push(cast(f.x_axis));
+                    particle_f.push(cast(f.y_axis));
+                    elastic_particle_mass.push(mass);
                 }
                 Matter::Liquid { liquid_density } => {
-                    sim.liquids.particle_x.push(x);
-                    sim.liquids.particle_d.push(d);
-                    sim.liquids.particle_c.push(c);
-                    sim.liquids.particle_desired_density.push(liquid_density);
-                    sim.liquids.particle_mass.push(mass);
+                    liquid_particle_x.push(cast(x));
+                    liquid_particle_d.push(cast(d));
+                    liquid_particle_c.push(cast(c.x_axis));
+                    liquid_particle_c.push(cast(c.y_axis));
+                    particle_desired_density.push(liquid_density);
+                    liquid_particle_mass.push(mass);
                 }
             }
         }
-        sim
+        Ok(Self {
+            num_particles,
+            grid_dx: Buffer::zeros(device.clone(), GRID_FLAT_LENGTH)?,
+            grid_dy: Buffer::zeros(device.clone(), GRID_FLAT_LENGTH)?,
+            grid_mass: Buffer::zeros(device.clone(), GRID_FLAT_LENGTH)?,
+            liquids: LiquidStorage {
+                particle_x: Buffer::from_vec(liquid_particle_x).into_device(device.clone())?,
+                particle_d: Buffer::from_vec(liquid_particle_d).into_device(device.clone())?,
+                particle_c: Buffer::from_vec(liquid_particle_c).into_device(device.clone())?,
+                particle_desired_density: Buffer::from_vec(particle_desired_density)
+                    .into_device(device.clone())?,
+                particle_mass: Buffer::from_vec(liquid_particle_mass)
+                    .into_device(device.clone())?,
+            },
+            elastics: ElasticStorage {
+                particle_x: Buffer::from_vec(elastic_particle_x).into_device(device.clone())?,
+                particle_d: Buffer::from_vec(elastic_particle_d).into_device(device.clone())?,
+                particle_c: Buffer::from_vec(elastic_particle_c).into_device(device.clone())?,
+                particle_f: Buffer::from_vec(particle_f).into_device(device.clone())?,
+                particle_mass: Buffer::from_vec(elastic_particle_mass)
+                    .into_device(device.clone())?,
+            },
+            device,
+        })
     }
     // TODO https://gafferongames.com/post/fix_your_timestep/
-    pub fn step(&mut self, dt: Real, iterations: usize) {
-        for _ in 0..iterations {
-            self.grid_dx = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
-            self.grid_dy = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
-            self.grid_mass = [const { Atomic::new(0) }; GRID_WIDTH * GRID_HEIGHT];
+    pub fn step(&mut self, dt: Real, iterations: usize) -> krnl::anyhow::Result<()> {
+        if self.num_particles == 0 {
+            return Ok(());
+        };
+        if self.liquids.particle_x.len() == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "gpu")]
+        {
+            for _ in 0..iterations {
+                // println!("Iteration {i}");
+                kernels::liquid_inner_loop::builder()?
+                    .specialize(GRID_FLAT_LENGTH as u32)
+                    // DONT CHANGE THREAD COUNT
+                    .with_threads(64)
+                    .build(self.device.clone())?
+                    .with_global_threads(self.num_particles)
+                    .dispatch(
+                        self.liquids.particle_x.as_slice(),
+                        self.liquids.particle_d.as_slice_mut(),
+                        self.liquids.particle_mass.as_slice(),
+                        self.liquids.particle_c.as_slice_mut(),
+                        self.liquids.particle_desired_density.as_slice(),
+                        self.grid_dx.as_slice_mut(),
+                        self.grid_dy.as_slice_mut(),
+                        self.grid_mass.as_slice_mut(),
+                    )?;
+            }
 
-            // PBD MPM, basically working to reset our deformation gradient gradually
-            Self::liquid_constraints(
-                &self.liquids.particle_desired_density,
-                &mut self.liquids.particle_c,
-            );
-            Self::elastic_constraints(&self.elastics.particle_f, &mut self.elastics.particle_c);
+            kernels::liquid_integrate::builder()?
+                .build(self.device.clone())?
+                .with_global_threads(self.num_particles)
+                .dispatch(
+                    dt,
+                    self.liquids.particle_x.as_slice_mut(),
+                    self.liquids.particle_d.as_slice_mut(),
+                    self.liquids.particle_desired_density.as_slice_mut(),
+                    self.liquids.particle_c.as_slice(),
+                )?;
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            for _ in 0..iterations {
+                self.grid_dx = [0; GRID_FLAT_LENGTH];
+                self.grid_dy = [0; GRID_FLAT_LENGTH];
+                self.grid_mass = [0; GRID_FLAT_LENGTH];
 
-            // 1. particle-to-grid P2G
-            Self::p2g(
-                &self.liquids.particle_x,
-                &self.liquids.particle_d,
-                &self.liquids.particle_c,
-                &self.liquids.particle_mass,
-                &self.grid_mass,
-                &self.grid_dx,
-                &self.grid_dy,
-            );
-            Self::p2g(
-                &self.elastics.particle_x,
-                &self.elastics.particle_d,
-                &self.elastics.particle_c,
-                &self.elastics.particle_mass,
-                &self.grid_mass,
-                &self.grid_dx,
-                &self.grid_dy,
-            );
+                // PBD MPM, basically working to reset our deformation gradient gradually
+                Self::liquid_constraints(
+                    &self.liquids.particle_desired_density,
+                    &mut self.liquids.particle_c,
+                );
+                Self::elastic_constraints(&self.elastics.particle_f, &mut self.elastics.particle_c);
 
-            // 2. calculate grid displacements
-            Self::update_grid(&self.grid_mass, &mut self.grid_dx, &mut self.grid_dy);
+                // 1. particle-to-grid P2G
+                Self::p2g(
+                    &self.liquids.particle_x,
+                    &self.liquids.particle_d,
+                    &self.liquids.particle_c,
+                    &self.liquids.particle_mass,
+                    &mut self.grid_dx,
+                    &mut self.grid_dy,
+                    &mut self.grid_mass,
+                );
+                Self::p2g(
+                    &self.elastics.particle_x,
+                    &self.elastics.particle_d,
+                    &self.elastics.particle_c,
+                    &self.elastics.particle_mass,
+                    &mut self.grid_dx,
+                    &mut self.grid_dy,
+                    &mut self.grid_mass,
+                );
 
-            // 3. grid-to-particle (G2P).
-            Self::g2p(
-                &self.grid_dx,
-                &self.grid_dy,
-                &self.liquids.particle_x,
-                &mut self.liquids.particle_d,
-                &mut self.liquids.particle_c,
+                // 2. calculate grid displacements
+                Self::update_grid(&self.grid_mass, &mut self.grid_dx, &mut self.grid_dy);
+
+                // 3. grid-to-particle (G2P).
+                // (grid is not mutated here, but g2p_step takes an unsafe slice to work on for the gpu
+                // impl, so we must also comply)
+                Self::g2p(
+                    &mut self.grid_dx,
+                    &mut self.grid_dy,
+                    &self.liquids.particle_x,
+                    &mut self.liquids.particle_d,
+                    &mut self.liquids.particle_c,
+                );
+                Self::g2p(
+                    &mut self.grid_dx,
+                    &mut self.grid_dy,
+                    &self.elastics.particle_x,
+                    &mut self.elastics.particle_d,
+                    &mut self.elastics.particle_c,
+                );
+            }
+
+            // 4. integrate our values to update our particle positions and deformation gradients
+            Self::liquid_integrate(
+                dt,
+                cast_slice(
+                    self.liquids
+                        .particle_c
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                cast_slice_mut(
+                    self.liquids
+                        .particle_x
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                cast_slice_mut(
+                    self.liquids
+                        .particle_d
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                self.liquids
+                    .particle_desired_density
+                    .as_slice_mut()
+                    .as_host_slice_mut()
+                    .unwrap(),
             );
-            Self::g2p(
-                &self.grid_dx,
-                &self.grid_dy,
-                &self.elastics.particle_x,
-                &mut self.elastics.particle_d,
-                &mut self.elastics.particle_c,
+            Self::elastic_integrate(
+                dt,
+                cast_slice(
+                    self.elastics
+                        .particle_c
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                cast_slice_mut(
+                    self.elastics
+                        .particle_x
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                cast_slice_mut(
+                    self.elastics
+                        .particle_d
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
+                cast_slice_mut(
+                    self.elastics
+                        .particle_f
+                        .as_slice_mut()
+                        .as_host_slice_mut()
+                        .unwrap(),
+                ),
             );
         }
-
-        // 4. integrate our values to update our particle positions and deformation gradients
-        Self::liquid_integrate(
-            dt,
-            &self.liquids.particle_c,
-            &mut self.liquids.particle_x,
-            &mut self.liquids.particle_d,
-            &mut self.liquids.particle_desired_density,
-        );
-        Self::elastic_integrate(
-            dt,
-            &self.elastics.particle_c,
-            &mut self.elastics.particle_x,
-            &mut self.elastics.particle_d,
-            &mut self.elastics.particle_f,
-        );
+        Ok(())
     }
-    pub fn elastic_constraints(particle_f: &[Matrix], particle_c: &mut [Matrix]) {
+    fn elastic_constraints(particle_f: &[Matrix], particle_c: &mut [Matrix]) {
         particle_c
             .par_iter_mut()
             .zip_eq(particle_f)
-            .for_each(|(c, f)| {
-                elastic_constrain(c, f)
-            })
+            .for_each(|(c, f)| kernels::elastic_constrain(c, f))
     }
-    pub fn liquid_constraints(particle_desired_density: &[Real], particle_c: &mut [Matrix]) {
+    fn liquid_constraints(particle_desired_density: &[Real], particle_c: &mut [Matrix]) {
         particle_c
             .par_iter_mut()
             .zip_eq(particle_desired_density)
-            .for_each(|(c, &liquid_density)| {
-                liquid_constrain(c, liquid_density)
-            })
+            .for_each(|(c, &liquid_density)| kernels::liquid_constrain(c, liquid_density))
     }
 
-    pub fn p2g(
+    fn p2g(
         particle_x: &[Vector],
         particle_d: &[Vector],
         particle_c: &[Matrix],
         particle_mass: &[Real],
-        grid_mass: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
-        grid_dx: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
-        grid_dy: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+        grid_dx: &mut [FixedPoint],
+        grid_dy: &mut [FixedPoint],
+        grid_mass: &mut [FixedPoint],
     ) {
         // here we modify over the whole grid, but they are given through shared references which
         // is valid since we will only use atomic operations on the grid
+        let grid_mass: UnsafeSlice<FixedPoint> = grid_mass.into();
+        let grid_dx: UnsafeSlice<FixedPoint> = grid_dx.into();
+        let grid_dy: UnsafeSlice<FixedPoint> = grid_dy.into();
         particle_x
             .par_iter()
             .zip_eq(particle_d)
             .zip_eq(particle_c)
             .zip_eq(particle_mass)
             .for_each(|(((&x, &d), &c), &mass)| {
-                p2g_step(grid_mass, grid_dx, grid_dy, x, d, c, mass)
+                kernels::p2g_step(grid_dx, grid_dy, grid_mass, x, d, c, mass)
             })
     }
-    pub fn update_grid(
-        grid_mass: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
-        grid_dx: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
-        grid_dy: &mut [Atomic; GRID_WIDTH * GRID_HEIGHT],
+    fn update_grid(
+        grid_mass: &[FixedPoint; GRID_FLAT_LENGTH],
+        grid_dx: &mut [FixedPoint; GRID_FLAT_LENGTH],
+        grid_dy: &mut [FixedPoint; GRID_FLAT_LENGTH],
     ) {
         grid_dx
             .par_iter_mut()
             .zip_eq(grid_dy.par_iter_mut())
             .enumerate()
             .zip_eq(grid_mass)
-            .for_each(|((i, (dx, dy)), mass)| {
-                grid_update_at(i, mass, dx, dy)
-            })
+            .for_each(|((i, (dx, dy)), mass)| kernels::grid_update_at(i, mass, dx, dy))
     }
-    pub fn g2p(
-        grid_dx: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
-        grid_dy: &[Atomic; GRID_WIDTH * GRID_HEIGHT],
+    fn g2p(
+        grid_dx: &mut [FixedPoint],
+        grid_dy: &mut [FixedPoint],
         particle_x: &[Vector],
         particle_d: &mut [Vector],
         particle_c: &mut [Matrix],
     ) {
+        let grid_dx: UnsafeSlice<FixedPoint> = grid_dx.into();
+        let grid_dy: UnsafeSlice<FixedPoint> = grid_dy.into();
         particle_d
             .par_iter_mut()
             .zip_eq(particle_c.par_iter_mut())
             .zip_eq(particle_x)
-            .for_each(|((d, c), &x)| {
-                g2p_step(grid_dx, grid_dy, d, c, x)
-            })
+            .for_each(|((d, c), &x)| kernels::g2p_step(grid_dx, grid_dy, d, c, x))
     }
-    pub fn liquid_integrate(
+    fn liquid_integrate(
         dt: Real,
         particle_c: &[Matrix],
         particle_x: &mut [Vector],
@@ -291,10 +376,10 @@ impl Simulation {
             .zip_eq(particle_desired_density.par_iter_mut())
             .zip_eq(particle_c)
             .for_each(|(((x, d), liquid_density), c)| {
-                liquid_integrate_step(dt, x, d, liquid_density, c)
+                kernels::liquid_integrate_step(dt, x, d, liquid_density, c)
             })
     }
-    pub fn elastic_integrate(
+    fn elastic_integrate(
         dt: Real,
         particle_c: &[Matrix],
         particle_x: &mut [Vector],
@@ -306,9 +391,6 @@ impl Simulation {
             .zip_eq(particle_d.par_iter_mut())
             .zip_eq(particle_f.par_iter_mut())
             .zip_eq(particle_c)
-            .for_each(|(((x, d), f), c)| {
-                elastic_integrate_step(dt, x, d, f, c)
-            })
+            .for_each(|(((x, d), f), c)| kernels::elastic_integrate_step(dt, x, d, f, c))
     }
 }
-

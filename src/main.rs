@@ -1,17 +1,31 @@
-#![deny(clippy::all)]
+#![allow(unexpected_cfgs)]
+pub mod frame;
+pub mod kernel;
+pub mod pbd_mpm;
 
 use error_iter::ErrorIter as _;
-use glam::{UVec2, Vec2};
 use log::error;
 use pixels::{Pixels, SurfaceTexture};
-use prepixx::{pbd_mpm::*, DOWN_SCALE};
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use prepixx::{
-    frame::World, pbd_mpm::Particle, CANVAS_HEIGHT, CANVAS_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH,
-};
+use frame::World;
+use glam::{UVec2, Vec2};
+use kernel::pbd_mpm::{CELL_HEIGHT, CELL_WIDTH, GRID_HEIGHT, GRID_WIDTH};
+use pbd_mpm::{Matter, Particle};
+
+#[krnl::macros::module]
+pub mod canvas_dims {
+    pub const WINDOW_WIDTH: usize = 512;
+    pub const WINDOW_HEIGHT: usize = 512;
+
+    pub const DOWN_SCALE: usize = 2;
+
+    pub const CANVAS_WIDTH: usize = WINDOW_WIDTH / DOWN_SCALE;
+    pub const CANVAS_HEIGHT: usize = WINDOW_HEIGHT / DOWN_SCALE;
+}
+use canvas_dims::*;
 
 fn main() -> Result<(), winit::error::EventLoopError> {
     env_logger::init();
@@ -19,7 +33,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = unsafe { App::new(World::init_liquid_box()) };
+    let mut app = App::new(World::init_liquid_box());
     event_loop.run_app(&mut app)
 }
 
@@ -42,8 +56,7 @@ struct App {
     cursor_position: UVec2,
 }
 impl App {
-    // App must be immediately given to event_loop to construct window and pixels buffer
-    unsafe fn new(world: World) -> Self {
+    fn new(world: World) -> Self {
         Self {
             place_particle: false,
             world,
@@ -138,5 +151,47 @@ impl ApplicationHandler for App {
         self.world.update();
 
         self.window.as_ref().unwrap().request_redraw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use krnl::{anyhow, buffer::Buffer, device::Device};
+
+    use super::*;
+    #[test]
+    fn world_update() {
+        let mut world = World::init_liquid_box();
+        assert_eq!(
+            world.simulation.num_particles,
+            world.simulation.liquids.particle_x.len() as u32
+        );
+        world.update();
+        assert_eq!(
+            world.simulation.num_particles,
+            world.simulation.liquids.particle_x.len() as u32
+        );
+    }
+    #[test]
+    fn world_update_and_draw() {
+        let mut world = World::init_liquid_box();
+        assert_eq!(
+            world.simulation.num_particles,
+            world.simulation.liquids.particle_x.len() as u32
+        );
+        world.update();
+        assert_eq!(
+            world.simulation.num_particles,
+            world.simulation.liquids.particle_x.len() as u32
+        );
+        world.draw(&mut [0; CANVAS_WIDTH * CANVAS_HEIGHT]);
+    }
+    #[test]
+    fn device_test() -> anyhow::Result<()> {
+        let v = vec![1u64, 2, 3];
+        let device = Device::builder().build()?;
+        let buffer = Buffer::from_vec(v.clone()).into_device(device)?;
+        assert_eq!(v.len(), buffer.len());
+        Ok(())
     }
 }

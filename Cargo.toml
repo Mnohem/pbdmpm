@@ -10,15 +10,22 @@ criterion = { version = "*", features = ["html_reports"] }
 name = "short_mpm_sim"
 harness = false
 
+[features]
+default = ["gpu"]
+gpu = []
+
 [dependencies]
 bytemuck = "1.21.0"
-bytemuck_derive = "1.8.1"
 env_logger = "0.11.3"
 error-iter = "0.4.1"
-glam = { version = "0.29.0", features = ["rand"] }
+glam = { version = "0.24.2", features = ["bytemuck"], default-features = false }
 krnl = "0.1.1"
 log = "0.4.21"
 pixels = "0.14.0"
 rand = "0.8.5"
 rayon = "1.10.0"
 winit = { version = "0.30.7", features = ["rwh_05"] }
+
+[package.metadata.krnlc.dependencies]
+glam = { features = ["bytemuck"], default-features = false }
+bytemuck = {}
